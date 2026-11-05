@@ -1,0 +1,36 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+//
+// 3DGRT tracer -- INTERSECTION (primitive_type=instances only).
+//
+// Port of OptiX __intersection__is for the instanced primitive: each gaussian is
+// one instance of the unit box, intersected in its object frame; if the ray hits,
+// report the hit distance. The any-hit shader then records it (gaussian id =
+// instance index). The icosahedron primitive uses the hardware triangle test.
+
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "bindings.glsl"
+
+#ifndef SPH_NUM_COEFFS
+#define SPH_NUM_COEFFS 16
+#endif
+
+layout(set = 0, binding = 2, scalar) readonly buffer Density  { ParticleDensity particles[]; } density;
+layout(set = 0, binding = 3, scalar) readonly buffer Radiance { float16_t sh[]; }  radiance;
+
+hitAttributeEXT vec2 hitAttr;   // unused, but required to call reportIntersectionEXT
+
+#include "gaussian_common.glsl"
+#include "gaussian_ops.glsl"
+
+void main() {
+    float hT;
+    const bool hit = intersectInstanceParticle(gl_ObjectRayOriginEXT, gl_ObjectRayDirectionEXT,
+                                               gl_RayTminEXT, gl_RayTmaxEXT, hT);
+    if (hit) {
+        hitAttr = vec2(0.0);
+        reportIntersectionEXT(hT, 0u);
+    }
+}

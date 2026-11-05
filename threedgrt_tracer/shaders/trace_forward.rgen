@@ -1,0 +1,216 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+//
+// 3DGRT forward tracer -- single-launch RAYGEN, compiled in two variants:
+//   - plain (no define): the port of the OptiX __raygen__rg, for forwards that no backward follows (rendering,
+//     validation). One launch per ray owns the windowed outer loop and the front-to-back integration; the
+//     per-window gather of the k nearest hits is delegated to traceRayEXT, whose any-hit fills the payload.
+//   - SPLIT_TAIL: the training forward's tail (see below).
+
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "bindings.glsl"
+
+#ifndef SPH_NUM_COEFFS
+#define SPH_NUM_COEFFS 16
+#endif
+
+layout(set = 0, binding = 1) uniform accelerationStructureEXT topLevelAS;
+
+layout(set = 0, binding = 2, scalar) readonly buffer Density   { ParticleDensity particles[]; } density;
+layout(set = 0, binding = 3, scalar) readonly buffer Radiance  { float16_t sh[]; }   radiance;
+layout(set = 0, binding = 4, scalar) readonly buffer RayOriBuf { float v[]; }     rayOriBuf;
+layout(set = 0, binding = 5, scalar) readonly buffer RayDirBuf { float v[]; }     rayDirBuf;
+
+layout(set = 0, binding = 6,  scalar) writeonly buffer OutRad  { float v[]; } outRad;
+layout(set = 0, binding = 7,  scalar) writeonly buffer OutDns  { float v[]; } outDns;
+layout(set = 0, binding = 8,  scalar) writeonly buffer OutHit  { float v[]; } outHit;   // 2 per ray
+layout(set = 0, binding = 9,  scalar) writeonly buffer OutNrm  { float v[]; } outNrm;
+layout(set = 0, binding = 10, scalar) writeonly buffer OutHc   { float v[]; } outHc;
+layout(set = 0, binding = 11, scalar) buffer OutVis            { int v[]; }   outVis;
+
+
+#ifdef SPLIT_TAIL
+// SPLIT TAIL: launched once after the split forward's gather/blend rounds. Rays the rounds finished (+INF cursor) or never
+// touched (NaN bits) return after one state read. A ray still alive at the round
+// cap resumes from the blend's saved state (cursor, T, radiance, depth, hit
+// count) and runs this megakernel loop to the end of the ray -- the same windows
+// the split rounds would have produced, with no cap. It publishes the final
+// outputs (outHit[1] = last processed hit t, the traced backward's end bound),
+// tombstones the cursor and flags the ray in bwdCnt for the overflow backward.
+// The tail also archives its windows, after the rounds' slots and in the same padded
+// layout, as long as whole windows fit. A ray that fits is then replayed by the apply
+// alone, like a ray the rounds finished, so the round count does not decide how much
+// the overflow backward re-traces. A ray that does not fit is flagged; the cursor
+// where its first unarchived window starts goes to plane 6, where the overflow
+// backward resumes.
+#include "split_state.glsl"
+layout(set = 0, binding = 18, scalar) buffer BwdHitCnt { uint v[]; } bwdCnt;
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#define BWD_ARCHIVE_WRITE_ONLY
+#include "bwd_archive.glsl"
+#endif
+// per-ray id scratch written by the any-hit (see trace_forward.rahit)
+layout(set = 0, binding = 16, scalar) readonly buffer HitScratch { uint v[]; } hitScr;
+
+#include "rt_payload.glsl"
+layout(location = 0) rayPayloadEXT HitPayload prd;
+#include "rt_sort.glsl"
+
+#include "gaussian_common.glsl"
+#include "gaussian_ops.glsl"
+
+vec2 intersectAABB(vec3 lo, vec3 hi, vec3 ro, vec3 rd) {
+    vec3 t0 = (lo - ro) / rd;
+    vec3 t1 = (hi - ro) / rd;
+    vec3 tmax = max(t0, t1);
+    vec3 tmin = min(t0, t1);
+    return vec2(max(0.0, max(tmin.x, max(tmin.y, tmin.z))),
+                min(tmax.x, min(tmax.y, tmax.z)));
+}
+
+void main() {
+    uint x = gl_LaunchIDEXT.x;
+    uint y = gl_LaunchIDEXT.y;
+    uint b = gl_LaunchIDEXT.z;
+    if (x >= params.frameW || y >= params.frameH || b >= params.frameB) return;
+
+    uint pix = (b * params.frameH + y) * params.frameW + x;
+#ifdef SPLIT_TAIL
+    const uint archivePix = archiveRayIndex(pix, x, y, b);
+    const uint statePix = pix;
+    const float cursor = stateF.v[1u * params.statePlaneRays + statePix];
+    // bit test, not float math: +INF = finished, 0xFFFFFFFF = never initialized
+    if ((floatBitsToUint(cursor) & 0x7F800000u) == 0x7F800000u) return;
+    // count the rays alive at the round cap (one atomic per subgroup) in the word after the
+    // per-ray counts: the host adapts the next frame's round count to it
+    {
+        const uint aliveLanes = subgroupBallotBitCount(subgroupBallot(true));
+        if (subgroupElect()) atomicAdd(bwdCnt.v[params.frameW * params.frameH * params.frameB], aliveLanes);
+    }
+#endif
+
+    vec3 oL = vec3(rayOriBuf.v[pix*3+0], rayOriBuf.v[pix*3+1], rayOriBuf.v[pix*3+2]);
+    vec3 dL = vec3(rayDirBuf.v[pix*3+0], rayDirBuf.v[pix*3+1], rayDirBuf.v[pix*3+2]);
+    vec3 ro = vec3(dot(params.rayToWorld0.xyz, oL) + params.rayToWorld0.w,
+                   dot(params.rayToWorld1.xyz, oL) + params.rayToWorld1.w,
+                   dot(params.rayToWorld2.xyz, oL) + params.rayToWorld2.w);
+    vec3 rd = vec3(dot(params.rayToWorld0.xyz, dL),
+                   dot(params.rayToWorld1.xyz, dL),
+                   dot(params.rayToWorld2.xyz, dL));
+
+    vec3  radianceAccum = vec3(0.0);
+    float transmittance = 1.0;
+    float hitDistance   = 0.0;
+    vec3  normalAccum   = vec3(0.0);
+    float hitsCount     = 0.0;
+
+    vec2 mm = intersectAABB(params.aabbMin.xyz, params.aabbMax.xyz, ro, rd);
+    float lastHit = max(0.0, mm.x - EPS_T);
+#ifdef SPLIT_TAIL
+    // resume the blend's march exactly where the last round left it
+    lastHit       = cursor;
+    transmittance = stateF.v[0u * params.statePlaneRays + statePix];
+    radianceAccum = vec3(stateF.v[2u * params.statePlaneRays + statePix],
+                         stateF.v[3u * params.statePlaneRays + statePix],
+                         stateF.v[4u * params.statePlaneRays + statePix]);
+    hitDistance   = stateF.v[5u * params.statePlaneRays + statePix];
+    if (HITCOUNTS_ON) hitsCount = stateF.v[7u * params.statePlaneRays + statePix];
+    // the rounds archived (round cap) x k slots of this ray; continue after them
+    uint tailRec = bwdCnt.v[pix] & ~BWD_CNT_OVERFLOW;
+    const uint tailCap = archiveCapacity() / uint(MAX_HITS_PER_TRACE) * uint(MAX_HITS_PER_TRACE);
+    bool tailFull = false;
+#endif
+
+    // cull back faces so each gaussian's icosahedron yields one front-face hit
+    const uint rayFlags = gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsCullBackFacingTrianglesEXT;
+
+    const uint scrBase = hitScratchBase();
+
+    while (lastHit <= mm.y && transmittance > params.minTransmittance) {
+        // ---- gather up to k nearest hits in (lastHit, mm.y] via traceRayEXT ----
+        for (int i = 0; i < MAX_HITS_PER_TRACE; ++i) {
+            prd.hdt[i] = INF_T;
+        }
+        prd.cntMax = 0u;
+        prd.maxHitDistance = -INF_T;
+
+        float tmin = lastHit + EPS_T;
+        float tmax = mm.y + EPS_T;
+        // any-hit ignores every intersection (gather-all), so nothing commits and
+        // the miss shader runs; the payload holds the gathered hits afterward.
+        traceRayEXT(topLevelAS, rayFlags, 0xFFu, 0u, 0u, 0u, ro, tmin, rd, tmax, 0);
+
+        uint winCnt = prd.cntMax & 0xFFFFu;
+        if (winCnt == 0u) break;
+#ifdef SPLIT_TAIL
+        // a non-empty window: archive it if it fits whole, else the overflow backward
+        // traces from here (lastHit is still this window's start cursor)
+        const bool tailWin = !tailFull && tailRec + uint(MAX_HITS_PER_TRACE) <= tailCap;
+        if (!tailWin && !tailFull) {
+            tailFull = true;
+            stateF.v[6u * params.statePlaneRays + statePix] = lastHit;
+        }
+        uint tailWd = 0u;   // accepted ids of this window so far (stored at its front)
+#endif
+
+        // copy the payload once into locals + register-resident sorting network.
+        // lhid holds buffer SLOT indices; the gaussian id is resolved through the
+        // per-ray scratch (HIT_ID below).
+        uint  lhid[MAX_HITS_PER_TRACE];
+        float lhdt[MAX_HITS_PER_TRACE];
+        loadAndSortHits(lhid, lhdt);
+#define HIT_T(i)  lhdt[i]
+#define HIT_VALID(i) (uint(i) < winCnt)
+#define HIT_ID(i)    hitScr.v[hitScratchSlot(scrBase, lhid[i])]
+
+        // ---- integrate the gathered hits front-to-back (identical to compute) ----
+        for (int i = 0; i < MAX_HITS_PER_TRACE; ++i) {
+#ifdef SPLIT_TAIL
+            uint recId = INVALID;   // uniform-slot write value (INVALID unless processed)
+#endif
+            if (HIT_VALID(i) && transmittance > params.minTransmittance) {
+                uint hitId = HIT_ID(i);
+                bool accepted = processHitFwd(ro, rd, hitId,
+                                              transmittance, radianceAccum, hitDistance, normalAccum);
+                if (accepted) outVis.v[hitId] = 1;
+#ifdef SPLIT_TAIL
+                if (accepted) recId = hitId;
+#endif
+                lastHit = max(lastHit, HIT_T(i));
+                if (HITCOUNTS_ON && accepted) hitsCount += 1.0;
+            }
+#ifdef SPLIT_TAIL
+            if (tailWin && recId != INVALID) archiveStore(tailRec + tailWd++, archivePix, recId);
+#endif
+        }
+#ifdef SPLIT_TAIL
+        if (tailWin && tailWd < uint(MAX_HITS_PER_TRACE)) archiveStore(tailRec + tailWd, archivePix, INVALID);
+        if (tailWin) tailRec += uint(MAX_HITS_PER_TRACE);
+#endif
+#undef HIT_ID
+#undef HIT_T
+#undef HIT_VALID
+    }
+
+    outRad.v[pix*3+0] = radianceAccum.x;
+    outRad.v[pix*3+1] = radianceAccum.y;
+    outRad.v[pix*3+2] = radianceAccum.z;
+    outDns.v[pix]     = 1.0 - transmittance;
+    outHit.v[pix*2+0] = hitDistance;
+    outHit.v[pix*2+1] = lastHit;
+    if (NORMALS_ON) {
+        outNrm.v[pix*3+0] = normalAccum.x;
+        outNrm.v[pix*3+1] = normalAccum.y;
+        outNrm.v[pix*3+2] = normalAccum.z;
+    }
+    if (HITCOUNTS_ON) {
+        outHc.v[pix] = hitsCount;
+    }
+#ifdef SPLIT_TAIL
+    stateF.v[1u * params.statePlaneRays + statePix] = uintBitsToFloat(0x7F800000u);
+    bwdCnt.v[pix] = tailRec | (tailFull ? BWD_CNT_OVERFLOW : 0u);
+#endif
+}

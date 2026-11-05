@@ -1,0 +1,22 @@
+method: 3dgrt # 3dgrt or 3dgut
+  
+pipeline_type: reference
+backward_pipeline_type: ${render.pipeline_type}Bwd
+particle_kernel_degree: 4
+particle_kernel_density_clamping: true
+particle_kernel_min_response: 0.0113
+particle_kernel_min_alpha: ${div:1.0,255.0}
+particle_kernel_max_alpha: 0.99
+particle_radiance_sph_degree: 3
+primitive_type: instances
+min_transmittance: 0.001
+# BVH update policy: the BVH is refitted in place (vertices moved, topology kept) for up to this many consecutive
+# steps, then rebuilt from scratch; densification always rebuilds it. 0 or 1 rebuilds it every step, as the OptiX
+# reference does. Refitting needs particle_kernel_density_clamping: false (with clamping, every step rebuilds).
+max_consecutive_bvh_update: 15
+# Backward gradient accumulation: true sums each Gaussian's gradients across the subgroup before the atomic
+# writes; false gives every ray its own atomic adds (to measure what the subgroup reduction saves).
+subgroup_atomics: true
+enable_normals: false
+enable_hitcounts: true
+enable_kernel_timings: false

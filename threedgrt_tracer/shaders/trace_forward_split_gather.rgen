@@ -1,0 +1,160 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+//
+// SPLIT FORWARD, phase 1 of 2: window-gather raygen (the training forward).
+//
+// One launch = ONE window of the ray march (wavefront style). The host loops
+// gather -> blend rounds until every ray terminates (fixed round count; dead
+// rays cost a single 4 B state read). Motivation, measured on the single-launch
+// forward: the megakernel interleaves BVH traversal with SH shading and the
+// list-recording write stream, so all three compete for L2 -- the recording
+// tax reaches ~+21 ms/frame at converged scenes. This raygen touches NOTHING
+// but the BVH: no ParticleDensity, no SH. Acceptance, blending and ERT live in
+// the blend compute pass (trace_forward_split_blend.comp), which owns the
+// per-ray march state.
+//
+// WINDOW HANDOFF: the sorted window is written DIRECTLY into the hit archive
+// bwdIds at slot round*k -- real
+// ids for slots < winCnt, INVALID padding beyond. The padding doubles as the
+// blend's end-of-window sentinel (first INVALID == "window ends here"; a
+// partial window is provably the LAST window). The blend then masks rejected
+// and post-ERT candidates with INVALID before backward reads this archive.
+// Thus the valid-prefix invariant holds ONLY at the gather -> blend handoff;
+// the finalized archive can contain INVALID holes between accepted hits. The
+// per-round archive base is round*k, warp-uniform, delivered by push constant
+// -- no per-ray cursor.
+//
+// Per-ray state (see blend for the full layout): stateF plane 1 = march cursor
+// (+INF dead, NaN bits 0xFFFFFFFF = uninitialized, host memsets 0xFF each
+// frame), plane 6 = this window's max hit t.
+//
+// SAFETY: the host clamps rounds so that rounds*k <= BWD_MAXH (vulkan_tracer
+// round clamp) -- therefore every slot the blend will read this round is
+// written HERE this round; no stale archive slot is ever blended.
+
+#extension GL_EXT_ray_tracing : require
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "bindings.glsl"
+
+
+layout(set = 0, binding = 1) uniform accelerationStructureEXT topLevelAS;
+
+layout(set = 0, binding = 4, scalar) readonly buffer RayOriBuf { float v[]; } rayOriBuf;
+layout(set = 0, binding = 5, scalar) readonly buffer RayDirBuf { float v[]; } rayDirBuf;
+
+// per-ray march state, float planes [plane * NRAYS + pix] (written by blend)
+#include "split_state.glsl"
+
+// the recording archive IS the window handoff (see header)
+#define BWD_ARCHIVE_WRITE_ONLY
+#include "bwd_archive.glsl"
+
+// pushed by the host before each gather/blend pair: the round index (0-based)
+layout(push_constant) uniform SplitPC { uint round_; } pc;
+
+
+#include "rt_payload.glsl"
+layout(location = 0) rayPayloadEXT HitPayload prd;
+layout(set = 0, binding = 16, scalar) readonly buffer HitScratch { uint v[]; } hitScr;
+#include "rt_sort.glsl"
+
+#include "gaussian_common.glsl"
+
+vec2 intersectAABB(vec3 lo, vec3 hi, vec3 ro, vec3 rd) {
+    vec3 t0 = (lo - ro) / rd;
+    vec3 t1 = (hi - ro) / rd;
+    return vec2(max(0.0, max(min(t0.x,t1.x), max(min(t0.y,t1.y), min(t0.z,t1.z)))),
+                min(max(t0.x,t1.x), min(max(t0.y,t1.y), max(t0.z,t1.z))));
+}
+
+void main() {
+    uint x = gl_LaunchIDEXT.x;
+    uint y = gl_LaunchIDEXT.y;
+    uint b = gl_LaunchIDEXT.z;
+    if (x >= params.frameW || y >= params.frameH || b >= params.frameB) return;
+
+    //[b][h][w] form 
+    uint pix   = (b * params.frameH + y) * params.frameW + x;
+    const uint nRays = params.frameW * params.frameH * params.frameB;
+    const uint statePix = pix;
+
+    const uint winBase = pc.round_ * uint(MAX_HITS_PER_TRACE);
+    // One store per slot, at the archive's blocked pixel address.
+#define WIN_STORE(s, id) { if (winBase + (s) < archiveCapacity()) archiveStore(winBase + (s), archivePix, (id)); }
+
+    // ---- liveness check: the cursor alone decides (uninit = first round) ----
+    // INVARIANT (load-bearing): the blend tombstones EVERY death -- T-exhaustion
+    // and scene-exhaustion alike -- as +INF in plane 1 in the same round it
+    // happens, so "T <= minT with a finite cursor" is unreachable here. Plane 0
+    // therefore need not be read. Dead rays write NOTHING: the blend exits on
+    // the same cursor word before touching any window slot.
+    float lastHit = stateF.v[1u * params.statePlaneRays + statePix];
+    //this checks is lastHit was ever initialized, round0 case
+    bool  uninit  = (floatBitsToUint(lastHit) == 0xFFFFFFFFu);
+    if (!uninit && isinf(lastHit)) return;
+    const uint archivePix = archiveRayIndex(pix, x, y, b);
+
+    //ray origin and ray direction in local space
+    vec3 oL = vec3(rayOriBuf.v[pix*3+0], rayOriBuf.v[pix*3+1], rayOriBuf.v[pix*3+2]);
+    vec3 dL = vec3(rayDirBuf.v[pix*3+0], rayDirBuf.v[pix*3+1], rayDirBuf.v[pix*3+2]);
+
+    //transform ray from local/cam to world space
+    vec3 ro = vec3(dot(params.rayToWorld0.xyz, oL) + params.rayToWorld0.w,
+                   dot(params.rayToWorld1.xyz, oL) + params.rayToWorld1.w,
+                   dot(params.rayToWorld2.xyz, oL) + params.rayToWorld2.w);
+    vec3 rd = vec3(dot(params.rayToWorld0.xyz, dL),
+                   dot(params.rayToWorld1.xyz, dL),
+                   dot(params.rayToWorld2.xyz, dL));
+
+    //bound whole scene by aabb
+    vec2 mm = intersectAABB(params.aabbMin.xyz, params.aabbMax.xyz, ro, rd);
+
+    // lastHit = max(0.0, mm.x-eps, lastHit) ******* think if NaN is necessary
+    if (uninit) lastHit = max(0.0, mm.x - EPS_T);   // fused-forward start cursor
+
+    // whats the condition when lastHit > mm.y - because we know that if code has reached here, it must be alive
+    if (lastHit > mm.y) {                            // scene exhausted before tracing
+        WIN_STORE(0u, INVALID);                      // sentinel: empty window
+        return;
+    }
+
+    // ---- one gather window: identical trace to the fused forward's ----
+    const uint rayFlags = gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsCullBackFacingTrianglesEXT;
+    const uint scrBase = hitScratchBase();
+
+    for (int i = 0; i < MAX_HITS_PER_TRACE; ++i)
+        prd.hdt[i] = INF_T;
+    prd.cntMax = 0u;
+    prd.maxHitDistance = -INF_T;
+
+    traceRayEXT(topLevelAS, rayFlags, 0xFFu, 0u, 0u, 0u, ro, lastHit + EPS_T, rd, mm.y + EPS_T, 0);
+
+    uint winCnt = prd.cntMax & 0xFFFFu;
+    if (winCnt == 0u) {
+        WIN_STORE(0u, INVALID);   // sentinel: empty window, blend finalizes the ray
+        return;
+    }
+
+    // Sort once: lhid holds scratch slot numbers, resolved through the scratch
+    // below. Hand the ordered window over: ALL k slots written (ids, then
+    // INVALID padding = the blend's sentinel + the apply's skip marker).
+    uint  lhid[MAX_HITS_PER_TRACE];
+    float lhdt[MAX_HITS_PER_TRACE];
+    loadAndSortHits(lhid, lhdt);
+
+    // constant-indexed loop (no data-dependent array index -> stays in registers);
+    // sorted ascending, so the max valid t is just the last predicated assignment.
+    float lastT = 0.0;
+    for (int i = 0; i < MAX_HITS_PER_TRACE; ++i) {
+        uint id = INVALID;
+        if (uint(i) < winCnt) {
+            id = hitScr.v[hitScratchSlot(scrBase, lhid[i])];
+            lastT = lhdt[i];
+        }
+        WIN_STORE(uint(i), id);
+    }
+    stateF.v[6u * params.statePlaneRays + statePix] = lastT;   // window max t: next round's cursor
+#undef WIN_STORE
+}

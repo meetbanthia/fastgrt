@@ -1,0 +1,184 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+//
+// SPLIT FORWARD, phase 2 of 2: window blend pass.
+//
+// Consumes the sorted candidate window the gather raygen just wrote and does
+// everything the fused forward's integrate loop did: params fetch, acceptance,
+// SH color, front-to-back compositing, ERT. Owns ALL per-ray march state
+// across rounds; the gather only reads liveness from it.
+//
+// WINDOW SOURCE: the window is read from the hit archive bwdIds at slot
+// round*k -- the gather wrote it there directly. This pass replaces rejected/post-ERT candidates with INVALID,
+// restoring the accepted-only, padded archive consumed by backward. The first
+// INVALID slot READ from the gather is the end-of-window sentinel; by the
+// k-buffer commit rule a partial window is provably the LAST window, so
+// meeting the sentinel also means the ray dies this round. INVALIDs written
+// here are acceptance holes, NOT end-of-window sentinels: never read a patched
+// slot again or break on INVALID in backward. This pass also publishes
+// bwdCnt (the apply's list length): (round+1)*k after a non-empty round,
+// 0 for rays that never saw a candidate, otherwise left at the previous
+// round's value (empty rounds contribute no archive slots -- the apply must
+// never read them, they are unwritten beyond slot 0).
+//
+// State layout, plane-major over NRAYS (adjacent rays adjacent -> coalesced):
+//   stateF: 0=transmittance  1=lastHit cursor (+INF = dead; NaN bits
+//           0xFFFFFFFF = uninitialized, host memsets 0xFF per frame)
+//           2,3,4=radianceAccum  5=depthAccum  6=window max t (gather-written)
+//           7=hitsCount (HITCOUNTS_ON)
+//
+// Every round saves the march state and publishes the outputs, so the frame's
+// outputs are final after any round; the cursor of a ray still alive at the
+// round cap stays finite, which is what the tail raygen resumes from.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "bindings.glsl"
+
+#ifndef SPH_NUM_COEFFS
+#define SPH_NUM_COEFFS 16
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 2, scalar) readonly buffer Density   { ParticleDensity particles[]; } density;
+layout(set = 0, binding = 3, scalar) readonly buffer Radiance  { float16_t sh[]; } radiance;
+layout(set = 0, binding = 4, scalar) readonly buffer RayOriBuf { float v[]; } rayOriBuf;
+layout(set = 0, binding = 5, scalar) readonly buffer RayDirBuf { float v[]; } rayDirBuf;
+
+layout(set = 0, binding = 6,  scalar) writeonly buffer OutRad  { float v[]; } outRad;
+layout(set = 0, binding = 7,  scalar) writeonly buffer OutDns  { float v[]; } outDns;
+layout(set = 0, binding = 8,  scalar) writeonly buffer OutHit  { float v[]; } outHit;   // 2 per ray
+layout(set = 0, binding = 10, scalar) writeonly buffer OutHc   { float v[]; } outHc;
+layout(set = 0, binding = 11, scalar) buffer OutVis            { int v[]; }   outVis;
+
+#include "bwd_archive.glsl"
+layout(set = 0, binding = 18, scalar) writeonly buffer BwdHitCnt { uint v[]; } bwdCnt;
+
+#include "split_state.glsl"
+
+// pushed by the host before each gather/blend pair: the round index (0-based)
+layout(push_constant) uniform SplitPC { uint round_; } pc;
+
+#include "gaussian_common.glsl"
+#include "gaussian_ops.glsl"   // processHitFwd (params fetch, acceptance, SH blend)
+
+void main() {
+    // clip rounded-up workgroups to the frame before touching state or the archive
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint b = gl_GlobalInvocationID.z;
+    if (x >= params.frameW || y >= params.frameH || b >= params.frameB) return;
+
+    uint pix = (b * params.frameH + y) * params.frameW + x;
+    const uint nRays = params.frameW * params.frameH * params.frameB;
+    const uint statePix = pix;
+
+    float lastHit = stateF.v[1u * params.statePlaneRays + statePix];
+    if (isinf(lastHit)) return;   // died in an earlier round; outputs already final
+
+    bool uninit = (floatBitsToUint(lastHit) == 0xFFFFFFFFu);
+
+    const uint archivePix = archiveRayIndex(pix, x, y, b);
+    const uint winBase = pc.round_ * uint(MAX_HITS_PER_TRACE);
+#define WIN_LOAD(s) archiveLoad(winBase + (s), archivePix)
+
+    // slot 0 decides whether this round has a window at all (gather's sentinel)
+    uint id0 = WIN_LOAD(0u);
+    bool ended = (id0 == INVALID);
+
+    // ---- restore march state (first round: fused-forward initial values) ----
+    float transm = uninit ? 1.0 : stateF.v[0u * params.statePlaneRays + statePix];
+    vec3  radAcc = uninit ? vec3(0.0)
+                          : vec3(stateF.v[2u * params.statePlaneRays + statePix],
+                                 stateF.v[3u * params.statePlaneRays + statePix],
+                                 stateF.v[4u * params.statePlaneRays + statePix]);
+    float depAcc = uninit ? 0.0 : stateF.v[5u * params.statePlaneRays + statePix];
+    float hitsCount = (uninit || !HITCOUNTS_ON) ? 0.0 : stateF.v[7u * params.statePlaneRays + statePix];
+
+    if (!ended) {
+        vec3 oL = vec3(rayOriBuf.v[pix*3+0], rayOriBuf.v[pix*3+1], rayOriBuf.v[pix*3+2]);
+        vec3 dL = vec3(rayDirBuf.v[pix*3+0], rayDirBuf.v[pix*3+1], rayDirBuf.v[pix*3+2]);
+        vec3 ro = vec3(dot(params.rayToWorld0.xyz, oL) + params.rayToWorld0.w,
+                       dot(params.rayToWorld1.xyz, oL) + params.rayToWorld1.w,
+                       dot(params.rayToWorld2.xyz, oL) + params.rayToWorld2.w);
+        vec3 rd = vec3(dot(params.rayToWorld0.xyz, dL),
+                       dot(params.rayToWorld1.xyz, dL),
+                       dot(params.rayToWorld2.xyz, dL));
+
+        vec3 nrmUnused = vec3(0.0);   // split path runs with normals disabled (host guard)
+
+        // ---- integrate: same per-hit predicate structure as the fused forward.
+        // 'ended' latches at the first INVALID (the gather's padding) and fences
+        // off the stale slots beyond it; the T gate reproduces mid-window ERT.
+        // Each archived window keeps its accepted ids at its front, in order, then one INVALID. Compacted in place: the window-local cursor never
+        // passes the slot being read, and these slots were written by the gather just before,
+        // so the stores land on cache lines still resident.
+        uint winDense = 0u;
+        for (int i = 0; i < MAX_HITS_PER_TRACE; ++i) {
+            uint hitId = (i == 0) ? id0 : WIN_LOAD(uint(i));
+            if (hitId == INVALID) ended = true;
+            bool accepted = false;
+            if (!ended && transm > params.minTransmittance) {
+                accepted = processHitFwd(ro, rd, hitId, transm, radAcc, depAcc, nrmUnused);
+                if (accepted) outVis.v[hitId] = 1;
+                if (HITCOUNTS_ON && accepted) hitsCount += 1.0;
+            }
+            // Use the ORIGINAL id for sentinel/liveness decisions above. Keep
+            // accepted ids in place; mask only real ids that did not contribute.
+            // Slot addresses remain warp-uniform. Gather -> blend and forward
+            // -> apply barriers order the two writers and the backward reader.
+            if (accepted) {
+                if (winDense != uint(i)) archiveStore(winBase + winDense, archivePix, hitId);
+                ++winDense;
+            }
+        }
+        // end of this window's accepted ids (the apply stops a window at its first INVALID)
+        if (winDense < uint(MAX_HITS_PER_TRACE)) archiveStore(winBase + winDense, archivePix, INVALID);
+        // whole window consumed (or ray died mid-window, in which case the
+        // cursor no longer steers anything): advance to the window's max t.
+        float winLastT = stateF.v[6u * params.statePlaneRays + statePix];
+        lastHit = uninit ? winLastT : max(lastHit, winLastT);
+    }
+
+    // list length for the apply, keyed on "does this round have a window" (slot
+    // 0's ORIGINAL id), NOT on 'ended' or the patched archive: a PARTIAL window
+    // is fully archived (accepted ids + INVALID holes/padding) and
+    // its blended hits MUST be visible to the apply, so it counts. Only an EMPTY
+    // round (id0 INVALID -- slots beyond 0 unwritten) is excluded, by leaving
+    // the previous round's value; miss rays that never saw a candidate publish 0.
+    if (id0 != INVALID)
+        bwdCnt.v[pix] = min((pc.round_ + 1u) * uint(MAX_HITS_PER_TRACE), archiveCapacity());
+    else if (uninit)
+        bwdCnt.v[pix] = 0u;
+
+    // ---- terminate or persist ----
+    // 'ended' == the window was partial or empty. A PARTIAL window is provably
+    // the LAST window: the k-buffer only commits (= shortens the ray) when it
+    // is full, so a non-full window means tmax stayed at the scene exit and the
+    // trace surveyed the entire remainder. Tombstoning now saves the trailing
+    // empty-discovery round for every exhaustion-terminated ray.
+    bool dead = ended || (transm <= params.minTransmittance);
+    stateF.v[0u * params.statePlaneRays + statePix] = transm;
+    stateF.v[2u * params.statePlaneRays + statePix] = radAcc.x;
+    stateF.v[3u * params.statePlaneRays + statePix] = radAcc.y;
+    stateF.v[4u * params.statePlaneRays + statePix] = radAcc.z;
+    stateF.v[5u * params.statePlaneRays + statePix] = depAcc;
+    if (HITCOUNTS_ON) stateF.v[7u * params.statePlaneRays + statePix] = hitsCount;
+    // +INF = dead marker. LOAD-BEARING: the gather's liveness check reads ONLY
+    // this word (it does not read T), so every death -- ERT or exhaustion --
+    // MUST be tombstoned here, in the round it occurs. See the gather prologue.
+    stateF.v[1u * params.statePlaneRays + statePix] = dead ? uintBitsToFloat(0x7F800000u) : lastHit;
+
+    // outputs as of this round (outHit needs the real cursor, not INF)
+    outRad.v[pix*3+0] = radAcc.x;
+    outRad.v[pix*3+1] = radAcc.y;
+    outRad.v[pix*3+2] = radAcc.z;
+    outDns.v[pix]     = 1.0 - transm;
+    outHit.v[pix*2+0] = depAcc;
+    // miss rays never got a cursor (still NaN bits): report 0 like an empty march
+    outHit.v[pix*2+1] = (uninit && id0 == INVALID) ? 0.0 : lastHit;
+    if (HITCOUNTS_ON) outHc.v[pix] = hitsCount;
+#undef WIN_LOAD
+}

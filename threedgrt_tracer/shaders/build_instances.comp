@@ -1,0 +1,119 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+//
+// primitive_type=instances AS build: the reference's instanced primitive
+// (computeGaussianEnclosingInstances). A single unit-box [-1,1]^3 BLAS is built
+// once, and every build emits one TLAS instance per gaussian whose transform
+// places/orients/scales that box by the kernel extent. The per-iteration build is
+// then a TLAS over N instances (or a refit).
+//
+// Per gaussian this writes a VkAccelerationStructureInstanceKHR (64 B):
+// transform = R * diag(kscl), translation = position; instanceCustomIndex =
+// gaussian id; ref = unit BLAS; SBT record 0 (the procedural hit group). The
+// union of the instances' world boxes is reduced into the scene bounds (the ray
+// bound in the tracers).
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, scalar) uniform AabbParams {
+    uint  numGaussians;
+    int   kernelDegree;
+    int   densityClamping;
+    float minResponse;
+    uint  blasRefLo;     // unit-BLAS device address (low 32 bits)
+    uint  blasRefHi;     // unit-BLAS device address (high 32 bits)
+} ap;
+
+layout(set = 0, binding = 1, scalar) readonly buffer Pos { float v[]; } pos;
+layout(set = 0, binding = 2, scalar) readonly buffer Rot { float v[]; } rot;
+layout(set = 0, binding = 3, scalar) readonly buffer Scl { float v[]; } scl;
+layout(set = 0, binding = 4, scalar) readonly buffer Dns { float v[]; } dns;
+
+// VkAccelerationStructureInstanceKHR, 64 bytes, scalar layout.
+struct AccelInstance {
+    float transform[12];              // VkTransformMatrixKHR: row-major 3x4
+    uint  instanceCustomIndex_mask;   // customIndex:24 | (mask:8 << 24)
+    uint  sbtOffset_flags;            // sbtOffset:24 | (flags:8 << 24)
+    uint64_t accelRef;                // unit-BLAS device address
+};
+layout(set = 0, binding = 5, scalar) writeonly buffer Inst   { AccelInstance v[]; } inst;
+layout(set = 0, binding = 7, scalar) buffer Bounds { uint v[6]; } bounds;   // scene min xyz, max xyz (ordered bits)
+
+// float <-> uint with the same ordering, so atomicMin/Max on uint order floats (as build_icosahedron.comp)
+uint orderedBits(float f) {
+    uint u = floatBitsToUint(f);
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+float kernelScale(float density, float modulatedMinResponse, int densityClamping, int degree) {
+    float responseModulation = (densityClamping != 0) ? density : 1.0;
+    float minResp = min(modulatedMinResponse / responseModulation, 0.97);
+    if (degree < 0) {
+        float k = float(abs(degree));
+        float s = 1.0 / pow(3.0, k);
+        return pow((1.0 / (log(minResp) - 1.0) + 1.0) / s, 1.0 / k);
+    }
+    if (degree == 0) {
+        return ((1.0 - minResp) / 3.0) / -0.329630334487;
+    }
+    float b = float(degree);
+    float a = -4.5 / pow(3.0, b);
+    return pow(log(minResp) / a, 1.0 / b);
+}
+
+void quatToMatrixTranspose(vec4 q, out vec3 T0, out vec3 T1, out vec3 T2) {
+    float r = q.x, x = q.y, y = q.z, z = q.w;
+    T0 = vec3(1.0 - 2.0*(y*y + z*z), 2.0*(x*y - r*z),       2.0*(x*z + r*y));
+    T1 = vec3(2.0*(x*y + r*z),       1.0 - 2.0*(x*x + z*z), 2.0*(y*z - r*x));
+    T2 = vec3(2.0*(x*z - r*y),       2.0*(y*z + r*x),       1.0 - 2.0*(x*x + y*y));
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= ap.numGaussians) return;
+
+    vec4 q     = vec4(rot.v[gid*4+0], rot.v[gid*4+1], rot.v[gid*4+2], rot.v[gid*4+3]);
+    vec3 scale = vec3(scl.v[gid*3+0], scl.v[gid*3+1], scl.v[gid*3+2]);
+    vec3 trans = vec3(pos.v[gid*3+0], pos.v[gid*3+1], pos.v[gid*3+2]);
+    float d    = dns.v[gid];
+
+    vec3 T0, T1, T2;
+    quatToMatrixTranspose(q, T0, T1, T2);
+    // the unit box scaled by the kernel extent itself
+    vec3 kscl = kernelScale(d, ap.minResponse, ap.densityClamping, ap.kernelDegree) * scale;
+
+    // Linear part M = R * diag(kscl): row a, col c is T_a[c] * kscl[c].
+    vec3 m0 = T0 * kscl;   // (T0.x*kscl.x, T0.y*kscl.y, T0.z*kscl.z)
+    vec3 m1 = T1 * kscl;
+    vec3 m2 = T2 * kscl;
+
+    // write the instance (row-major 3x4 transform)
+    inst.v[gid].transform[0]  = m0.x; inst.v[gid].transform[1]  = m0.y; inst.v[gid].transform[2]  = m0.z; inst.v[gid].transform[3]  = trans.x;
+    inst.v[gid].transform[4]  = m1.x; inst.v[gid].transform[5]  = m1.y; inst.v[gid].transform[6]  = m1.z; inst.v[gid].transform[7]  = trans.y;
+    inst.v[gid].transform[8]  = m2.x; inst.v[gid].transform[9]  = m2.y; inst.v[gid].transform[10] = m2.z; inst.v[gid].transform[11] = trans.z;
+    inst.v[gid].instanceCustomIndex_mask = (gid & 0x00FFFFFFu) | (0xFFu << 24);   // mask = 0xFF
+    inst.v[gid].sbtOffset_flags          = 0u;   // the pipeline's only hit group (procedural); flags = 0
+    inst.v[gid].accelRef                 = (uint64_t(ap.blasRefHi) << 32) | uint64_t(ap.blasRefLo);
+
+    // world AABB of the transformed unit box (half-extent = sum|row|): the box the reference's IAS bounds
+    vec3 he = vec3(abs(m0.x)+abs(m0.y)+abs(m0.z),
+                   abs(m1.x)+abs(m1.y)+abs(m1.z),
+                   abs(m2.x)+abs(m2.y)+abs(m2.z));
+    // scene bounds = union of the instance boxes (what OptiX emits as the reference IAS's AABB)
+    vec3 lo = trans - he, hi = trans + he;
+    lo = subgroupMin(lo);
+    hi = subgroupMax(hi);
+    if (subgroupElect()) {
+        atomicMin(bounds.v[0], orderedBits(lo.x));
+        atomicMin(bounds.v[1], orderedBits(lo.y));
+        atomicMin(bounds.v[2], orderedBits(lo.z));
+        atomicMax(bounds.v[3], orderedBits(hi.x));
+        atomicMax(bounds.v[4], orderedBits(hi.y));
+        atomicMax(bounds.v[5], orderedBits(hi.z));
+    }
+}

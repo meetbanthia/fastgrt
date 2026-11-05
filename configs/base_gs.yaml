@@ -1,0 +1,164 @@
+defaults:
+  - _self_
+  - /strategy: gs
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+path: ???
+seed_initialization: 42  # seed for rng in model initialization
+experiment_name: ""
+resume: ""
+out_dir: "./runs"
+n_iterations: 30000
+val_frequency: 5000
+num_workers: 24
+use_wandb: false
+wandb_project: "3dgrt"
+test_last: true
+validate_first: false
+log_frequency: 1
+compute_extra_metrics: true
+
+enable_frame_timings: false
+
+enable_writer: true
+writer:
+  hit_stat_frequency: 999999
+  max_num_hits: 128
+  log_image_views: ${int_list:[ 0, 13, 27, 43, 78 ]}
+
+export_ply:
+  enabled: false
+  path: ""
+import_ply:
+  enabled: false
+  path: ""
+  init_global_step: 0
+  
+export_usd:
+  enabled: false
+  path: ""
+  apply_normalizing_transform: true
+  format: standard  # "nurec" for internal USDVol format, "standard" for USDVol ParticleField3DGaussianSplat
+  half_precision: false
+  export_cameras: true
+  export_background: true
+  # zDepth | cameraDistance | rayHitDistance
+  sorting_mode_hint: cameraDistance
+  # Enable post-processing export when the checkpoint contains a supported module.
+  # Defaults to true; ppisp-integration-mode controls how PPISP is exported.
+  export_post_processing: true
+  # spg-runtime authors PPISP as Omniverse SPG shaders applied at render time.
+  # sh-optimized folds one fixed PPISP transform into Gaussian SH coefficients.
+  # spg-runtime | sh-optimized
+  ppisp-integration-mode: spg-runtime
+  # Optional fixed PPISP camera/frame. sh-optimized defaults unset values to 0;
+  # spg-runtime keeps dynamic per-camera/per-frame behavior when unset.
+  ppisp-reference-camera-id: null
+  ppisp-reference-frame-id: null
+  # Achromatic PPISP responsivity default authored on spg-runtime SPG shaders.
+  # To rescale asset radiance by k while preserving the PPISP input magnitude,
+  # set scene-radiance-scale: k and ppisp-responsivity: 1/k.
+  ppisp-responsivity: 1.0
+  # null = auto-export controllers when the PPISP checkpoint has them.
+  # true = require controller export; false = force static/time-sampled fallback.
+  enable-ppisp-controller-export: null
+  # Number of optimizer steps for sh-optimized export. null uses the default (3000).
+  sh-optimization-num-iterations: null
+  # Multiplicative scale applied to exported SH radiance.
+  scene-radiance-scale: 1.0
+  # USD timeCodesPerSecond; time codes are bare frame indices so this sets playback speed
+  frames_per_second: 1.0
+
+model:
+  density_activation: sigmoid
+  scale_activation: exp
+  default_density: 0.1
+  default_scale_factor: 1.0
+  optimize_density: true
+  optimize_features_albedo: true
+  optimize_features_specular: true
+  optimize_position: true
+  optimize_rotation: true
+  optimize_scale: true
+  bvh_update_frequency: 1
+  progressive_training:
+    feature_type: "sh" # one of [sh, mlp], currently only sh supported
+    init_n_features: 0 # sh: initial sh deg | mlp: num of dims initially unmasked
+    max_n_features: 3 # sh: maximum sh deg | mlp: total num of dims finally unmasked
+    increase_frequency: 1000 # unmask more feature dimensions every N global steps
+    increase_step: 1 # sh: how many degrees unmasked per step | mlp: how many dims unmasked per step
+
+  background:
+    name: background-color # one of [skip-background, background-color]
+    color: black # one of [black, white, random] needs to be defined if name == background-color
+
+  print_stats: true
+
+checkpoint:
+  iterations: ${int_list:[ 7000, 30000 ]}
+
+optimizer:
+  type: adam # We only support adam and selective_adam for now
+  lr: 0.0
+  eps: 1.e-15
+  params:
+    positions:
+      lr: 0.00016 # 3DGS value: 0.00016 initial and decayed to 0.0000016
+    density:
+      lr: 0.05 # 3DGS value: 0.05
+    features_albedo:
+      lr: 0.0025 # 3DGS value: 0.0025
+    features_specular:
+      lr: ${div:${optimizer.params.features_albedo.lr},20} # 3DGS value 20x smaller than lr of features_albedo
+    rotation:
+      lr: 0.001 # 3DGS value: 0.001
+    scale:
+      lr: 0.005 # 3DGS value: 0.005
+
+scheduler:
+  positions:
+    # In the 3DGS paper they additionally have a parameter lr_delay_mult, but is is not being used so I drop it here
+    type: exp
+    lr_init: ${optimizer.params.positions.lr}
+    lr_final: 0.0000016
+
+    max_steps: 30000
+
+  density:
+    type: skip
+
+loss:
+  use_l1: true
+  lambda_l1: 0.8
+  
+  use_l2: false
+  lambda_l2: 1.0
+
+  use_ssim: true
+  lambda_ssim: 0.2
+
+  use_opacity: false
+  lambda_opacity: 0.0
+
+  use_scale: false
+  lambda_scale: 0.0
+
+# Post-processing configuration
+post_processing:
+  # null | "ppisp" | "linear-to-srgb"
+  method: null
+  # Enable the controller for predicting per-frame corrections for novel views.
+  # When false, zero corrections are used for novel views.
+  use_controller: true
+  # Number of extra distillation steps after main training (only for "ppisp").
+  # When > 0, enables distillation mode: Gaussians and PPISP params are frozen,
+  # only the controller is trained for these additional steps.
+  n_distillation_steps: 5000
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false
+  run:
+    dir: .

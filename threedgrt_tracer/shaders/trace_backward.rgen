@@ -1,0 +1,149 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+//
+// 3DGRT backward tracer -- OVERFLOW RAYGEN.
+//
+// Runs after the apply pass, for the rays the split forward's tail finished
+// past the hit archive (bwdCnt flagged); every other ray returns after one
+// read. The apply replayed their archived first rounds and left its backward
+// state in the split state planes; this raygen traces only the rest of the ray,
+// from the cursor the tail stored in plane 6 (where its first unarchived window
+// starts) to the forward's last processed hit. The gather is identical to the
+// forward (traceRayEXT fills the payload with the k nearest hits of the window
+// via the shared any-hit); the integration accumulates analytic gradients into
+// the per-gaussian gradient buffers (atomicAdd, inside processHitBwd).
+
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "bindings.glsl"
+
+#ifndef SPH_NUM_COEFFS
+#define SPH_NUM_COEFFS 16
+#endif
+
+layout(set = 0, binding = 1) uniform accelerationStructureEXT topLevelAS;
+
+layout(set = 0, binding = 2, scalar) readonly buffer Density  { ParticleDensity particles[]; } density;
+layout(set = 0, binding = 3, scalar) readonly buffer Radiance { float16_t sh[]; } radiance;
+layout(set = 0, binding = 4, scalar) readonly buffer RayOriBuf { float v[]; } rayOriBuf;
+layout(set = 0, binding = 5, scalar) readonly buffer RayDirBuf { float v[]; } rayDirBuf;
+
+layout(set = 0, binding = 6,  scalar) readonly buffer FwdRad { float v[]; } fwdRad;
+layout(set = 0, binding = 7,  scalar) readonly buffer FwdDns { float v[]; } fwdDns;
+layout(set = 0, binding = 8,  scalar) readonly buffer FwdHit { float v[]; } fwdHit;   // 2 per ray
+layout(set = 0, binding = 10, scalar) readonly buffer GradRad { float v[]; } gradRad;
+layout(set = 0, binding = 11, scalar) readonly buffer GradDns { float v[]; } gradDns;
+layout(set = 0, binding = 12, scalar) readonly buffer GradHit { float v[]; } gradHit;
+
+layout(set = 0, binding = 14, scalar) buffer DensityGrad { ParticleDensity particles[]; } densityGrad;
+layout(set = 0, binding = 15, scalar) buffer RadGrad     { float sh[]; } radGrad;
+
+layout(set = 0, binding = 18, scalar) readonly buffer BwdHitCnt { uint v[]; } bwdCnt;
+#include "split_state.glsl"
+
+#include "rt_payload.glsl"
+layout(location = 0) rayPayloadEXT HitPayload prd;
+// per-ray id scratch written by the (shared) any-hit
+layout(set = 0, binding = 16, scalar) readonly buffer HitScratch { uint v[]; } hitScr;
+#include "rt_sort.glsl"
+
+#include "gaussian_common.glsl"
+#include "gaussian_ops.glsl"      // radianceFromSpH (used by processHitBwd)
+#include "gaussian_ops_bwd.glsl"  // processHitBwd
+
+vec2 intersectAABB(vec3 lo, vec3 hi, vec3 ro, vec3 rd) {
+    vec3 t0 = (lo - ro) / rd;
+    vec3 t1 = (hi - ro) / rd;
+    return vec2(max(0.0, max(min(t0.x,t1.x), max(min(t0.y,t1.y), min(t0.z,t1.z)))),
+                min(max(t0.x,t1.x), min(max(t0.y,t1.y), max(t0.z,t1.z))));
+}
+
+void main() {
+    uint x = gl_LaunchIDEXT.x;
+    uint y = gl_LaunchIDEXT.y;
+    uint b = gl_LaunchIDEXT.z;
+    if (x >= params.frameW || y >= params.frameH || b >= params.frameB) return;
+
+    uint pix = (b * params.frameH + y) * params.frameW + x;
+    if ((bwdCnt.v[pix] & BWD_CNT_OVERFLOW) == 0u) return;
+
+    vec3 oL = vec3(rayOriBuf.v[pix*3+0], rayOriBuf.v[pix*3+1], rayOriBuf.v[pix*3+2]);
+    vec3 dL = vec3(rayDirBuf.v[pix*3+0], rayDirBuf.v[pix*3+1], rayDirBuf.v[pix*3+2]);
+    vec3 ro = vec3(dot(params.rayToWorld0.xyz, oL) + params.rayToWorld0.w,
+                   dot(params.rayToWorld1.xyz, oL) + params.rayToWorld1.w,
+                   dot(params.rayToWorld2.xyz, oL) + params.rayToWorld2.w);
+    vec3 rd = vec3(dot(params.rayToWorld0.xyz, dL),
+                   dot(params.rayToWorld1.xyz, dL),
+                   dot(params.rayToWorld2.xyz, dL));
+
+    vec3  rayIntegratedRadiance      = vec3(fwdRad.v[pix*3+0], fwdRad.v[pix*3+1], fwdRad.v[pix*3+2]);
+    float rayIntegratedTransmittance = 1.0 - fwdDns.v[pix];
+    float rayIntegratedHitDistance   = fwdHit.v[pix*2+0];
+    float rayMaxHitDistance          = fwdHit.v[pix*2+1];
+
+    vec3  rayRadianceGrad      = vec3(gradRad.v[pix*3+0], gradRad.v[pix*3+1], gradRad.v[pix*3+2]);
+    float rayTransmittanceGrad = -1.0 * gradDns.v[pix];
+    float rayHitDistanceGrad   = gradHit.v[pix];
+
+    vec2 mm = intersectAABB(params.aabbMin.xyz, params.aabbMax.xyz, ro, rd);
+    float startT = max(0.0, mm.x - EPS_T);
+    // rayMaxHitDistance is the t of the forward's last processed hit. EPS_T (1e-9) is below
+    // fp32 resolution at scene distances, so a hit exactly there fell on tmax and was not
+    // reported: the backward dropped its gradient. Widen the bound relatively instead.
+    float endT   = min(rayMaxHitDistance, mm.y) * (1.0 + 1e-6) + EPS_T;
+
+    vec3  rayRadiance      = vec3(0.0);
+    float rayTransmittance = 1.0;
+    float rayHitDistance   = 0.0;
+    {
+        const uint sp = pix;
+        startT           = stateF.v[6u * params.statePlaneRays + sp];
+        rayTransmittance = stateF.v[0u * params.statePlaneRays + sp];
+        rayRadiance      = vec3(stateF.v[2u * params.statePlaneRays + sp],
+                                stateF.v[3u * params.statePlaneRays + sp],
+                                stateF.v[4u * params.statePlaneRays + sp]);
+        rayHitDistance   = stateF.v[5u * params.statePlaneRays + sp];
+    }
+
+    const uint rayFlags = gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsCullBackFacingTrianglesEXT;
+
+    const uint scrBase = hitScratchBase();
+
+    while (startT < endT) {
+        for (int i = 0; i < MAX_HITS_PER_TRACE; ++i) {
+            prd.hdt[i] = INF_T;
+        }
+        prd.cntMax = 0u;
+        prd.maxHitDistance = -INF_T;
+
+        traceRayEXT(topLevelAS, rayFlags, 0xFFu, 0u, 0u, 0u, ro, startT + EPS_T, rd, endT, 0);
+
+        uint winCnt = prd.cntMax & 0xFFFFu;
+        if (winCnt == 0u) break;
+        // copy the payload once into locals + register-resident sorting network.
+        // lhid holds buffer SLOT indices (resolved via HIT_ID below).
+        uint  lhid[MAX_HITS_PER_TRACE];
+        float lhdt[MAX_HITS_PER_TRACE];
+        loadAndSortHits(lhid, lhdt);
+#define HIT_T(i)  lhdt[i]
+#define HIT_VALID(i) (uint(i) < winCnt)
+#define HIT_ID(i)    hitScr.v[hitScratchSlot(scrBase, lhid[i])]
+
+        for (int i = 0; i < MAX_HITS_PER_TRACE; ++i) {
+            if (HIT_VALID(i)) {
+                processHitBwd(ro, rd, HIT_ID(i),
+                              params.minResponse, params.minAlpha, params.minTransmittance, params.sphDegree,
+                              rayIntegratedTransmittance,
+                              rayTransmittance, rayTransmittanceGrad,
+                              rayIntegratedRadiance, rayRadiance, rayRadianceGrad,
+                              rayIntegratedHitDistance, rayHitDistance, rayHitDistanceGrad);
+                startT = max(startT, HIT_T(i));
+            }
+        }
+#undef HIT_ID
+#undef HIT_T
+#undef HIT_VALID
+    }
+}

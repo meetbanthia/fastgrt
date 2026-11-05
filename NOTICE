@@ -1,0 +1,11 @@
+FastGRT
+Copyright (c) 2026 The FastGRT Authors
+
+This project is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It is derived from 3DGRUT (https://github.com/nv-tlabs/3dgrut),
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES, licensed under the
+Apache License, Version 2.0. Files that carry an NVIDIA copyright header
+originate from 3DGRUT and may have been modified for FastGRT. The main changes
+are: the OptiX/CUDA ray tracer was replaced by a Vulkan ray-tracing pipeline
+(threedgrt_tracer/), and the training loop and configurations were adapted to it.

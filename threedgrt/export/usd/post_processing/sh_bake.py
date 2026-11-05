@@ -1,0 +1,437 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Fit fixed post-processing transforms into Gaussian SH coefficients for export."""
+
+from __future__ import annotations
+
+import copy
+import logging
+from typing import Iterable
+
+import torch
+import torch.nn as nn
+
+from threedgrt.datasets.utils import configure_dataloader_for_platform
+from threedgrt.utils.render import C0, apply_post_processing
+
+logger = logging.getLogger(__name__)
+
+
+def scale_sh_output(model, scale: float) -> None:
+    """In-place scale the SH-evaluated RGB output by ``scale``.
+
+    SH eval is ``rgb = features_albedo * C0 + 0.5 + sum_k Y_k * features_specular_k``.
+    Scales each term so the forward eval yields ``s * rgb``:
+      * features_specular -> s * features_specular
+      * features_albedo   -> s * features_albedo + (s - 1) * 0.5 / C0
+        (compensates the constant ``0.5`` offset in the DC band)
+    """
+    if scale == 1.0:
+        return
+    s = float(scale)
+    with torch.no_grad():
+        model.features_specular.mul_(s)
+        model.features_albedo.mul_(s).add_((s - 1.0) * 0.5 / C0)
+    logger.info("Scaled SH output by %.4f (DC offset compensated)", s)
+
+
+class PostProcessingBakeAdapter:
+    """Adapter interface for baking one fixed post-processing transform."""
+
+    name = "post-processing"
+
+    def validate(self, post_processing: nn.Module) -> None:
+        del post_processing
+
+    def create_fixed_post_processing(self, post_processing: nn.Module, device: str) -> nn.Module:
+        return copy.deepcopy(post_processing).to(device).eval()
+
+    def apply_fit_transform(self, rgb: torch.Tensor, fixed_post_processing: nn.Module, gpu_batch) -> torch.Tensor:
+        del fixed_post_processing, gpu_batch
+        return rgb
+
+    def initialize_fit(self, baked_model, post_processing: nn.Module) -> None:
+        """Optionally warm-start the SH fit with a closed-form initialization.
+
+        Default is a no-op: the cloned ``baked_model`` keeps its checkpoint
+        SH coefficients as the starting point.
+        """
+        del baked_model, post_processing
+
+    def log_context(self) -> str:
+        return ""
+
+
+def _set_sh_fit_parameters(model) -> Iterable[torch.nn.Parameter]:
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    fit_parameters = []
+    for field_name in ("features_albedo", "features_specular"):
+        parameter = getattr(model, field_name)
+        parameter.requires_grad_(True)
+        fit_parameters.append(parameter)
+    return fit_parameters
+
+
+def _create_train_dataloader(conf, train_dataset):
+    num_workers = int(getattr(conf, "num_workers", 8))
+    dataloader_kwargs = configure_dataloader_for_platform(
+        {
+            "num_workers": num_workers,
+            "batch_size": 1,
+            "shuffle": True,
+            "pin_memory": True,
+            "persistent_workers": True if num_workers > 0 else False,
+        }
+    )
+    return torch.utils.data.DataLoader(train_dataset, **dataloader_kwargs)
+
+
+def _render_reference(reference_model, fixed_post_processing, gpu_batch) -> torch.Tensor:
+    with torch.no_grad():
+        outputs = reference_model(gpu_batch)
+        outputs = apply_post_processing(fixed_post_processing, outputs, gpu_batch, training=True)
+        return outputs["pred_rgb"].detach()
+
+
+def bake_post_processing_into_sh(
+    model,
+    post_processing: nn.Module,
+    train_dataset,
+    conf,
+    *,
+    adapter: PostProcessingBakeAdapter,
+    epochs: int = 7,
+    num_iterations: int | None = None,
+    learning_rate: float = 2.5e-3,
+    learning_rate_specular: float | None = None,
+    learning_rate_density: float = 5.0e-2,
+    device: str = "cuda",
+    view_sampling_mode: str = "training",
+    interpolated_views_seed: int | None = None,
+    trajectory_weight_position: float = 1.0,
+    trajectory_weight_rotation: float = 0.5,
+):
+    """Return a cloned model whose SH coefficients approximate fixed post-processing output.
+
+    Co-optimises three parameter groups:
+
+    * ``features_albedo``     at ``learning_rate``                (default 2.5e-3)
+    * ``features_specular``   at ``learning_rate_specular``       (default = lr/20)
+    * ``density``             at ``learning_rate_density``        (default 5e-2)
+
+    ``view_sampling_mode`` controls what the optimizer sees each step:
+
+    * ``"training"`` (default) -- iterate the training dataloader.
+    * ``"trajectory"`` -- order the training views along an approximate
+      Hamiltonian path (NN + 2-opt on a position+direction metric),
+      arc-length-parameterise the path on ``[0, 1]``, sample random
+      ``t ∈ [0, 1]``, and slerp inside the bracketing segment.
+
+    Trajectory mode synthesises a ``Batch`` per step from the template of
+    the first training batch, replacing ``T_to_world`` with the
+    interpolated pose. ``steps_per_epoch`` matches ``len(train_dataloader)``.
+    """
+    from threedgrt.export.usd.post_processing.view_interpolation import (
+        VIEW_SAMPLING_TRAINING,
+        InterpolatedViewSampler,
+        normalize_view_sampling_mode,
+    )
+
+    if not hasattr(model, "clone"):
+        raise TypeError("Post-processing SH bake export requires a cloneable MixtureOfGaussians model.")
+    if train_dataset is None:
+        raise ValueError("Post-processing SH bake export requires a train dataset. Pass --dataset if it is missing.")
+    if post_processing is None:
+        raise ValueError("Post-processing SH bake export requires a post_processing module.")
+    if epochs < 1:
+        raise ValueError(f"epochs must be >= 1, got {epochs}.")
+    if num_iterations is not None:
+        if isinstance(num_iterations, bool) or not isinstance(num_iterations, int):
+            raise TypeError(f"num_iterations must be int, got {type(num_iterations).__name__}")
+        if num_iterations < 1:
+            raise ValueError(f"num_iterations must be >= 1, got {num_iterations}.")
+    view_sampling_mode = normalize_view_sampling_mode(view_sampling_mode)
+
+    adapter.validate(post_processing)
+    reference_model = model.to(device).eval()
+    reference_model.build_acc()
+    baked_model = model.clone().to(device).eval()
+    baked_model.build_acc()
+    fixed_post_processing = adapter.create_fixed_post_processing(post_processing, device)
+
+    # Warm-start the cloned SH state with the adapter's closed-form bake.
+    adapter.initialize_fit(baked_model, post_processing)
+
+    if learning_rate_specular is None:
+        learning_rate_specular = learning_rate / 20.0
+
+    _set_sh_fit_parameters(baked_model)
+    baked_model.density.requires_grad_(True)
+    optimizer = torch.optim.Adam(
+        [
+            {"params": [baked_model.features_albedo], "lr": learning_rate},
+            {"params": [baked_model.features_specular], "lr": learning_rate_specular},
+            {"params": [baked_model.density], "lr": learning_rate_density},
+        ]
+    )
+    train_dataloader = _create_train_dataloader(conf, train_dataset)
+    steps_per_epoch = len(train_dataloader)
+
+    sampler: InterpolatedViewSampler | None = None
+    if view_sampling_mode != VIEW_SAMPLING_TRAINING:
+        # Cache one real training batch to seed the synthetic sampler with
+        # valid intrinsics / rays / pixel coords; only T_to_world changes per step.
+        first_batch = next(iter(train_dataloader))
+        template = train_dataset.get_gpu_batch_with_intrinsics(first_batch)
+        sampler = InterpolatedViewSampler(
+            train_dataset,
+            template_gpu_batch=template,
+            mode=view_sampling_mode,
+            steps_per_epoch=steps_per_epoch,
+            seed=interpolated_views_seed,
+            weight_position=trajectory_weight_position,
+            weight_rotation=trajectory_weight_rotation,
+        )
+
+    total_steps = num_iterations if num_iterations is not None else epochs * steps_per_epoch
+    num_epochs = max(1, (total_steps + steps_per_epoch - 1) // steps_per_epoch)
+    logger.info(
+        "Fitting %s SH bake: mode=%s iterations=%s steps_per_epoch=%s%s",
+        adapter.name,
+        view_sampling_mode,
+        total_steps,
+        steps_per_epoch,
+        adapter.log_context(),
+    )
+
+    def _gpu_batches():
+        if sampler is None:
+            for batch in train_dataloader:
+                yield train_dataset.get_gpu_batch_with_intrinsics(batch)
+        else:
+            for gpu_batch in sampler:
+                yield gpu_batch
+
+    with torch.enable_grad():
+        global_step = 0
+        for epoch in range(num_epochs):
+            for gpu_batch in _gpu_batches():
+                if global_step >= total_steps:
+                    break
+                global_step += 1
+                reference_rgb = _render_reference(reference_model, fixed_post_processing, gpu_batch)
+
+                optimizer.zero_grad(set_to_none=True)
+                baked_outputs = baked_model(gpu_batch)
+                fitted_rgb = adapter.apply_fit_transform(
+                    baked_outputs["pred_rgb"],
+                    fixed_post_processing,
+                    gpu_batch,
+                )
+                loss = torch.nn.functional.mse_loss(fitted_rgb, reference_rgb)
+
+                loss.backward()
+                optimizer.step()
+
+                if global_step == 1 or global_step % 50 == 0 or global_step == total_steps:
+                    logger.info(
+                        "%s SH bake epoch %s/%s step %s/%s loss=%.6g",
+                        adapter.name,
+                        epoch + 1,
+                        num_epochs,
+                        global_step,
+                        total_steps,
+                        float(loss.detach()),
+                    )
+            if global_step >= total_steps:
+                break
+
+    for parameter in baked_model.parameters():
+        parameter.requires_grad_(False)
+    baked_model.eval()
+    logger.info("%s SH bake complete", adapter.name)
+    return baked_model
+
+
+MODE_PPISP_BAKE_VIGNETTING_NONE = "none"
+MODE_PPISP_BAKE_VIGNETTING_ACHROMATIC_FIT = "achromatic-fit"
+PPISP_BAKE_VIGNETTING_MODES = {
+    MODE_PPISP_BAKE_VIGNETTING_NONE,
+    MODE_PPISP_BAKE_VIGNETTING_ACHROMATIC_FIT,
+}
+
+
+class FixedPPISP(nn.Module):
+    """Wrap PPISP as one fixed camera/frame color transform."""
+
+    def __init__(
+        self,
+        ppisp: nn.Module,
+        camera_id: int,
+        frame_id: int,
+        device: str,
+        include_vignetting: bool = True,
+    ) -> None:
+        super().__init__()
+        self.camera_id = int(camera_id)
+        self.frame_id = int(frame_id)
+        self.ppisp = copy.deepcopy(ppisp).to(device).eval()
+
+        if hasattr(self.ppisp, "config") and hasattr(self.ppisp.config, "use_controller"):
+            self.ppisp.config.use_controller = False
+        if not include_vignetting and hasattr(self.ppisp, "vignetting_params"):
+            with torch.no_grad():
+                self.ppisp.vignetting_params.zero_()
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        pixel_coords: torch.Tensor,
+        resolution: tuple[int, int],
+        camera_idx=None,
+        frame_idx=None,
+        exposure_prior=None,
+    ) -> torch.Tensor:
+        del camera_idx, frame_idx, exposure_prior
+        return self.ppisp(
+            rgb,
+            pixel_coords,
+            resolution=resolution,
+            camera_idx=self.camera_id,
+            frame_idx=self.frame_id,
+            exposure_prior=None,
+        )
+
+
+def normalize_ppisp_bake_vignetting_mode(mode: str | None) -> str:
+    normalized = MODE_PPISP_BAKE_VIGNETTING_NONE if mode is None else str(mode).strip().lower()
+    if normalized not in PPISP_BAKE_VIGNETTING_MODES:
+        raise ValueError(
+            f"Unsupported PPISP bake vignetting mode '{mode}'. "
+            f"Expected one of: {sorted(PPISP_BAKE_VIGNETTING_MODES)}"
+        )
+    return normalized
+
+
+def estimate_achromatic_vignetting(
+    ppisp: nn.Module,
+    camera_id: int,
+    pixel_coords: torch.Tensor,
+    resolution: tuple[int, int],
+) -> torch.Tensor:
+    """Estimate luminance falloff from PPISP's chromatic camera vignette."""
+    if not hasattr(ppisp, "vignetting_params"):
+        raise ValueError("PPISP-like module is missing vignetting_params.")
+
+    width, height = resolution
+    max_res = float(max(width, height))
+    vig_params = ppisp.vignetting_params[int(camera_id)].to(device=pixel_coords.device, dtype=pixel_coords.dtype)
+
+    u = (pixel_coords[..., 0] - float(width) * 0.5) / max_res
+    v = (pixel_coords[..., 1] - float(height) * 0.5) / max_res
+    uv = torch.stack([u, v], dim=-1)
+
+    channel_falloff = []
+    for channel in range(3):
+        center = vig_params[channel, 0:2]
+        delta = uv - center
+        r2 = torch.sum(delta * delta, dim=-1)
+        falloff = (
+            1.0 + vig_params[channel, 2] * r2 + vig_params[channel, 3] * r2 * r2 + vig_params[channel, 4] * r2 * r2 * r2
+        )
+        channel_falloff.append(torch.clamp(falloff, 0.0, 1.0))
+
+    rgb_falloff = torch.stack(channel_falloff, dim=-1)
+    luminance_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=pixel_coords.device, dtype=pixel_coords.dtype)
+    return torch.sum(rgb_falloff * luminance_weights, dim=-1, keepdim=True)
+
+
+def apply_achromatic_vignetting(
+    rgb: torch.Tensor,
+    ppisp: nn.Module,
+    camera_id: int,
+    pixel_coords: torch.Tensor,
+    resolution: tuple[int, int],
+) -> torch.Tensor:
+    return rgb * estimate_achromatic_vignetting(ppisp, camera_id, pixel_coords, resolution)
+
+
+class PPISPPostProcessingBakeAdapter(PostProcessingBakeAdapter):
+    name = "PPISP post-processing"
+
+    def __init__(
+        self,
+        camera_id: int = 0,
+        frame_id: int = 0,
+        vignetting_mode: str = MODE_PPISP_BAKE_VIGNETTING_NONE,
+    ) -> None:
+        self.camera_id = int(camera_id)
+        self.frame_id = int(frame_id)
+        self.vignetting_mode = normalize_ppisp_bake_vignetting_mode(vignetting_mode)
+
+    def validate(self, post_processing: nn.Module) -> None:
+        if not hasattr(post_processing, "exposure_params") or not hasattr(post_processing, "crf_params"):
+            raise ValueError("PPISP SH bake export requires a PPISP-like post_processing module.")
+
+        num_frames = int(post_processing.exposure_params.shape[0])
+        num_cameras = int(post_processing.crf_params.shape[0])
+        if self.frame_id < 0 or self.frame_id >= num_frames:
+            raise ValueError(f"frame_id must be in [0, {num_frames - 1}], got {self.frame_id}.")
+        if self.camera_id < 0 or self.camera_id >= num_cameras:
+            raise ValueError(f"camera_id must be in [0, {num_cameras - 1}], got {self.camera_id}.")
+
+    def create_fixed_post_processing(self, post_processing: nn.Module, device: str) -> nn.Module:
+        return FixedPPISP(
+            post_processing,
+            self.camera_id,
+            self.frame_id,
+            device,
+            include_vignetting=self.vignetting_mode == MODE_PPISP_BAKE_VIGNETTING_ACHROMATIC_FIT,
+        ).eval()
+
+    def apply_fit_transform(self, rgb: torch.Tensor, fixed_post_processing: nn.Module, gpu_batch) -> torch.Tensor:
+        del fixed_post_processing, gpu_batch
+        # SH eval lives in display (gamma) space; identity transform clamped to [0, 1].
+        return torch.clamp(rgb, 0.0, 1.0)
+
+    def initialize_fit(self, baked_model, post_processing: nn.Module) -> None:
+        """Warm-start with a DC-only simple-bake on the chosen (camera,
+        frame), in display (gamma) space.
+
+        features_albedo is set in display-referred RGB; features_specular is
+        left untouched.
+        """
+        from threedgrt.export.usd.post_processing.sh_simple_bake import simple_bake
+
+        logger.info(
+            "PPISP SH bake init: applying simple_bake (camera=%d, frame=%d, "
+            "higher_order=False, apply_srgb_to_linear=False) before fitting.",
+            self.camera_id,
+            self.frame_id,
+        )
+        simple_bake(
+            baked_model,
+            post_processing,
+            camera_id=self.camera_id,
+            frame_id=self.frame_id,
+            higher_order=False,
+            apply_srgb_to_linear=False,
+        )
+
+    def log_context(self) -> str:
+        return f" camera={self.camera_id} frame={self.frame_id} vignetting={self.vignetting_mode}"

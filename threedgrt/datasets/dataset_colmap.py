@@ -1,0 +1,647 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+import os
+import platform
+from typing import Optional
+
+import ncore.sensors
+import numpy as np
+import torch
+from ncore.data import (
+    OpenCVFisheyeCameraModelParameters,
+    OpenCVPinholeCameraModelParameters,
+    ShutterType,
+)
+from PIL import Image
+from torch.utils.data import Dataset
+
+from threedgrt.utils.logger import logger
+
+from .protocols import Batch, BoundedMultiViewDataset
+from .utils import (
+    compute_max_radius,
+    create_pixel_coords,
+    get_center_and_diag,
+    get_worker_id,
+    pinhole_camera_rays,
+    qvec_to_so3,
+    read_colmap_extrinsics_binary,
+    read_colmap_extrinsics_text,
+    read_colmap_intrinsics_binary,
+    read_colmap_intrinsics_text,
+)
+
+
+def _opencv_pinhole_intrinsics_from_colmap(intr_model: str, intr_params: np.ndarray, scaling_factor: float):
+    """Convert COLMAP distorted pinhole parameters to OpenCVPinholeCameraModelParameters fields."""
+    intr_params = np.asarray(intr_params, dtype=np.float32)
+    radial_coeffs = np.zeros((6,), dtype=np.float32)
+    tangential_coeffs = np.zeros((2,), dtype=np.float32)
+    thin_prism_coeffs = np.zeros((4,), dtype=np.float32)
+
+    if intr_model == "SIMPLE_RADIAL":
+        focal_length = np.array([intr_params[0], intr_params[0]], dtype=np.float32) / scaling_factor
+        principal_point = intr_params[1:3] / scaling_factor
+        radial_coeffs[0] = intr_params[3]
+    elif intr_model == "RADIAL":
+        focal_length = np.array([intr_params[0], intr_params[0]], dtype=np.float32) / scaling_factor
+        principal_point = intr_params[1:3] / scaling_factor
+        radial_coeffs[:2] = intr_params[3:5]
+    elif intr_model == "OPENCV":
+        focal_length = intr_params[:2] / scaling_factor
+        principal_point = intr_params[2:4] / scaling_factor
+        radial_coeffs[:2] = intr_params[4:6]
+        tangential_coeffs[:] = intr_params[6:8]
+    elif intr_model == "FULL_OPENCV":
+        focal_length = intr_params[:2] / scaling_factor
+        principal_point = intr_params[2:4] / scaling_factor
+        radial_coeffs[:] = intr_params[[4, 5, 8, 9, 10, 11]]
+        tangential_coeffs[:] = intr_params[6:8]
+    else:
+        raise ValueError(f"Unsupported distorted pinhole camera model: {intr_model}")
+
+    return focal_length, principal_point, radial_coeffs, tangential_coeffs, thin_prism_coeffs
+
+
+class ColmapDataset(Dataset, BoundedMultiViewDataset):
+    def __init__(
+        self,
+        path,
+        device="cuda",
+        split="train",
+        downsample_factor=1,
+        test_split_interval=8,
+        ray_jitter=None,
+        exif_exposures: Optional[list[Optional[float]]] = None,
+        camera_names: Optional[list[str]] = None,
+        camera_ids: Optional[list[int]] = None,
+    ):
+        self.path = path
+        self.device = device
+        self.split = split
+        self.downsample_factor = downsample_factor
+        self.ray_jitter = ray_jitter
+        self.test_split_interval = test_split_interval
+        self._all_exif_exposures = exif_exposures  # Exposure values for all frames (pre-split)
+        self.camera_names = list(camera_names) if camera_names is not None else None
+        self.camera_ids = [int(camera_id) for camera_id in camera_ids] if camera_ids is not None else None
+
+        # Worker-based GPU cache for multiprocessing compatibility
+        self._worker_gpu_cache = {}
+
+        # (Re)load intrinsics and extrinsics
+        self.reload()
+
+    def reload(self):
+        # GPU cache of processed camera intrinsics - now per camera ID
+        self.intrinsics = {}
+
+        # Get the scene data
+        self.load_intrinsics_and_extrinsics()
+        frame_indices_before_split = self._filter_cameras()
+
+        # Build mapping from COLMAP camera_id to 0-based contiguous index
+        # This is needed for post-processing which expects 0-based camera indices
+        sorted_camera_ids = sorted(self.cam_intrinsics.keys())
+        self._camera_id_to_idx = {cam_id: idx for idx, cam_id in enumerate(sorted_camera_ids)}
+
+        self.n_frames = len(self.cam_extrinsics)
+        self.load_camera_data()
+        indices = np.arange(self.n_frames)
+
+        # If test_split_interval is set, every test_split_interval frame will be excluded from the training set
+        # If test_split_interval is non-positive, all images will be used for training and testing
+        if self.test_split_interval > 0:
+            if self.split == "train":
+                indices = np.mod(indices, self.test_split_interval) != 0
+            else:
+                indices = np.mod(indices, self.test_split_interval) == 0
+
+        self.cam_extrinsics = [self.cam_extrinsics[i] for i in np.where(indices)[0]]
+        self.poses = self.poses[indices].astype(np.float32)
+
+        # numpy str array of image paths and mask paths
+        self.image_paths = self.image_paths[indices]
+        self.mask_paths = self.mask_paths[indices]
+
+        self.camera_centers = self.camera_centers[indices]
+        self.center, self.length_scale, self.scene_bbox = self.compute_spatial_extents()
+
+        # Apply split indices to EXIF exposures
+        if self._all_exif_exposures is not None:
+            frame_exif_exposures = [self._all_exif_exposures[i] for i in frame_indices_before_split]
+            self.exif_exposures: Optional[list[Optional[float]]] = [
+                frame_exif_exposures[i] for i in np.where(indices)[0]
+            ]
+        else:
+            self.exif_exposures = None
+
+        # Update the number of frames to only include the samples from the split
+        self.n_frames = self.poses.shape[0]
+
+        # Clear existing worker caches to force recreation with new intrinsics
+        self._worker_gpu_cache.clear()
+
+    def load_intrinsics_and_extrinsics(self):
+        try:
+            cameras_extrinsic_file = os.path.join(self.path, "sparse/0", "images.bin")
+            cameras_intrinsic_file = os.path.join(self.path, "sparse/0", "cameras.bin")
+            self.cam_extrinsics = read_colmap_extrinsics_binary(cameras_extrinsic_file)
+            self.cam_intrinsics = read_colmap_intrinsics_binary(cameras_intrinsic_file)
+        except:
+            cameras_extrinsic_file = os.path.join(self.path, "sparse/0", "images.txt")
+            cameras_intrinsic_file = os.path.join(self.path, "sparse/0", "cameras.txt")
+            self.cam_extrinsics = read_colmap_extrinsics_text(cameras_extrinsic_file)
+            self.cam_intrinsics = read_colmap_intrinsics_text(cameras_intrinsic_file)
+
+    def _camera_names_by_id(self) -> dict[int, str]:
+        sorted_camera_ids = sorted(self.cam_intrinsics.keys())
+        camera_id_to_idx = {camera_id: idx for idx, camera_id in enumerate(sorted_camera_ids)}
+        names: dict[int, str] = {camera_id: f"camera_{camera_id_to_idx[camera_id]}" for camera_id in sorted_camera_ids}
+
+        for extr in self.cam_extrinsics:
+            parent_folder = os.path.dirname(extr.name)
+            if parent_folder:
+                names[extr.camera_id] = parent_folder
+
+        return names
+
+    def _filter_cameras(self) -> list[int]:
+        selected_camera_ids = set(self.cam_intrinsics.keys())
+        names_by_id = self._camera_names_by_id()
+
+        if self.camera_ids is not None:
+            requested_ids = set(self.camera_ids)
+            missing_ids = sorted(requested_ids - selected_camera_ids)
+            if missing_ids:
+                available_ids = sorted(selected_camera_ids)
+                raise ValueError(f"COLMAP camera_ids {missing_ids} not found. Available camera_ids: {available_ids}")
+            selected_camera_ids &= requested_ids
+
+        if self.camera_names is not None:
+            name_to_ids: dict[str, set[int]] = {}
+            for camera_id, camera_name in names_by_id.items():
+                name_to_ids.setdefault(camera_name, set()).add(camera_id)
+
+            requested_names = set(self.camera_names)
+            missing_names = sorted(requested_names - set(name_to_ids))
+            if missing_names:
+                available_names = sorted(name_to_ids)
+                raise ValueError(
+                    f"COLMAP camera_names {missing_names} not found. Available camera_names: {available_names}"
+                )
+
+            selected_camera_ids &= set().union(*(name_to_ids[camera_name] for camera_name in requested_names))
+
+        if not selected_camera_ids:
+            raise ValueError("COLMAP camera selection is empty.")
+
+        frame_indices = [
+            frame_idx for frame_idx, extr in enumerate(self.cam_extrinsics) if extr.camera_id in selected_camera_ids
+        ]
+        if not frame_indices:
+            selected_names = [names_by_id[camera_id] for camera_id in sorted(selected_camera_ids)]
+            raise ValueError(f"COLMAP camera selection {selected_names} has no frames.")
+
+        if self.camera_names is not None or self.camera_ids is not None:
+            selected_names = [names_by_id[camera_id] for camera_id in sorted(selected_camera_ids)]
+            logger.info(
+                f"Using COLMAP cameras: {selected_names} "
+                f"(camera_ids={sorted(selected_camera_ids)}, frames={len(frame_indices)})"
+            )
+
+        self.cam_extrinsics = [self.cam_extrinsics[i] for i in frame_indices]
+        self.cam_intrinsics = {
+            camera_id: intr for camera_id, intr in self.cam_intrinsics.items() if camera_id in selected_camera_ids
+        }
+        return frame_indices
+
+    def get_images_folder(self):
+        downsample_suffix = "" if self.downsample_factor == 1 else f"_{self.downsample_factor}"
+        return f"images{downsample_suffix}"
+
+    def load_camera_data(self):
+        """
+        Load the camera data and generate rays for each camera.
+        This function is called on CPU for multiprocessing compatibility
+        GPU tensors will be created per-worker as needed
+        """
+        self._camera_data_params = {}
+        self._store_camera_params_cpu()
+
+    def _store_camera_params_cpu(self):
+        """Store camera parameters on CPU for multiprocessing compatibility."""
+
+        def create_pinhole_camera(focalx, focaly, w, h, cx=None, cy=None):
+            cx = cx if cx is not None else w / 2.0
+            cy = cy if cy is not None else h / 2.0
+            # Generate UV coordinates
+            u = np.tile(np.arange(w), h)
+            v = np.arange(h).repeat(w)
+            out_shape = (1, h, w, 3)
+            params = OpenCVPinholeCameraModelParameters(
+                resolution=np.array([w, h], dtype=np.uint64),
+                shutter_type=ShutterType.GLOBAL,
+                principal_point=np.array([cx, cy], dtype=np.float32),
+                focal_length=np.array([focalx, focaly], dtype=np.float32),
+                radial_coeffs=np.zeros((6,), dtype=np.float32),
+                tangential_coeffs=np.zeros((2,), dtype=np.float32),
+                thin_prism_coeffs=np.zeros((4,), dtype=np.float32),
+            )
+            rays_o_cam, rays_d_cam = pinhole_camera_rays(u, v, focalx, focaly, w, h, self.ray_jitter, cx=cx, cy=cy)
+            pixel_coords = create_pixel_coords(w, h)
+            return (
+                params.to_dict(),
+                torch.tensor(rays_o_cam, dtype=torch.float32).reshape(out_shape),
+                torch.tensor(rays_d_cam, dtype=torch.float32).reshape(out_shape),
+                type(params).__name__,
+                pixel_coords,
+            )
+
+        def create_opencv_pinhole_camera(
+            focal_length,
+            principal_point,
+            w,
+            h,
+            radial_coeffs,
+            tangential_coeffs,
+            thin_prism_coeffs,
+        ):
+            # Generate UV coordinates
+            u = np.tile(np.arange(w), h)
+            v = np.arange(h).repeat(w)
+            out_shape = (1, h, w, 3)
+            params = OpenCVPinholeCameraModelParameters(
+                resolution=np.array([w, h], dtype=np.uint64),
+                shutter_type=ShutterType.GLOBAL,
+                principal_point=np.asarray(principal_point, dtype=np.float32),
+                focal_length=np.asarray(focal_length, dtype=np.float32),
+                radial_coeffs=np.asarray(radial_coeffs, dtype=np.float32),
+                tangential_coeffs=np.asarray(tangential_coeffs, dtype=np.float32),
+                thin_prism_coeffs=np.asarray(thin_prism_coeffs, dtype=np.float32),
+            )
+            camera_model = ncore.sensors.CameraModel.from_parameters(params, device="cpu", dtype=torch.float32)
+            int_pixel_coords = torch.tensor(np.stack([u, v], axis=1), dtype=torch.int32)
+            image_points = camera_model.pixels_to_image_points(int_pixel_coords)
+            rays_d_cam = camera_model.image_points_to_camera_rays(image_points)
+            rays_o_cam = torch.zeros_like(rays_d_cam)
+            pixel_coords = create_pixel_coords(w, h)
+            return (
+                params.to_dict(),
+                rays_o_cam.to(torch.float32).reshape(out_shape),
+                rays_d_cam.to(torch.float32).reshape(out_shape),
+                type(params).__name__,
+                pixel_coords,
+            )
+
+        def create_fisheye_camera(params, w, h):
+            # Generate UV coordinates
+            u = np.tile(np.arange(w), h)
+            v = np.arange(h).repeat(w)
+            out_shape = (1, h, w, 3)
+            resolution = np.array([w, h]).astype(np.uint64)
+            principal_point = params[2:4].astype(np.float32)
+            focal_length = params[0:2].astype(np.float32)
+            radial_coeffs = params[4:].astype(np.float32)
+            # Estimate max angle for fisheye
+            max_radius_pixels = compute_max_radius(resolution.astype(np.float64), principal_point)
+            fov_angle_x = 2.0 * max_radius_pixels / focal_length[0]
+            fov_angle_y = 2.0 * max_radius_pixels / focal_length[1]
+            max_angle = np.max([fov_angle_x, fov_angle_y]) / 2.0
+
+            params = OpenCVFisheyeCameraModelParameters(
+                principal_point=principal_point,
+                focal_length=focal_length,
+                radial_coeffs=radial_coeffs,
+                resolution=resolution,
+                max_angle=max_angle,
+                shutter_type=ShutterType.GLOBAL,
+            )
+            camera_model = ncore.sensors.CameraModel.from_parameters(params, device="cpu", dtype=torch.float32)
+            int_pixel_coords = torch.tensor(np.stack([u, v], axis=1), dtype=torch.int32)
+            image_points = camera_model.pixels_to_image_points(int_pixel_coords)
+            rays_d_cam = camera_model.image_points_to_camera_rays(image_points)
+            rays_o_cam = torch.zeros_like(rays_d_cam)
+            pixel_coords = create_pixel_coords(w, h)
+            return (
+                params.to_dict(),
+                rays_o_cam.to(torch.float32).reshape(out_shape),
+                rays_d_cam.to(torch.float32).reshape(out_shape),
+                type(params).__name__,
+                pixel_coords,
+            )
+
+        cam_id_to_image_name = {extr.camera_id: extr.name for extr in self.cam_extrinsics}
+
+        for intr in self.cam_intrinsics.values():
+            full_width = intr.width
+            full_height = intr.height
+
+            image_name = cam_id_to_image_name[intr.id]
+            image_name = (
+                os.path.join(os.path.split(image_name)[1], "") if self.get_images_folder() in image_name else image_name
+            )
+            image_path = os.path.join(self.path, self.get_images_folder(), image_name)
+
+            try:
+                # Load the image to get its actual dimensions
+                with Image.open(image_path) as img:
+                    width, height = img.size
+            except FileNotFoundError:
+                logger.error(f"Image {image_path} not found. Cannot determine dimensions for intrinsic ID {intr.id}.")
+                continue
+
+            # Calculate scaling factor to match the image dimensions to the intrinsic dimensions
+            scaling_factor = int(round(intr.height / height))
+            expected_size = f"{full_width / scaling_factor}x{full_height / scaling_factor}"
+            assert (
+                abs(full_width / scaling_factor - width) <= 1
+            ), f"Scaled image dimension {expected_size} (factor {scaling_factor}x) does not match the actual image dimensions {width}x{height}"
+            assert (
+                abs(full_height / scaling_factor - height) <= 1
+            ), f"Scaled image dimension {expected_size} (factor {scaling_factor}x) does not match the actual image dimensions {width}x{height}"
+
+            if intr.model == "SIMPLE_PINHOLE":
+                focal_length = intr.params[0] / scaling_factor
+                cx = intr.params[1] / scaling_factor
+                cy = intr.params[2] / scaling_factor
+                self.intrinsics[intr.id] = create_pinhole_camera(
+                    focal_length, focal_length, width, height, cx=cx, cy=cy
+                )
+
+            elif intr.model == "PINHOLE":
+                focal_length_x = intr.params[0] / scaling_factor
+                focal_length_y = intr.params[1] / scaling_factor
+                cx = intr.params[2] / scaling_factor
+                cy = intr.params[3] / scaling_factor
+                self.intrinsics[intr.id] = create_pinhole_camera(
+                    focal_length_x, focal_length_y, width, height, cx=cx, cy=cy
+                )
+
+            elif intr.model in {"SIMPLE_RADIAL", "RADIAL", "OPENCV", "FULL_OPENCV"}:
+                focal_length, principal_point, radial_coeffs, tangential_coeffs, thin_prism_coeffs = (
+                    _opencv_pinhole_intrinsics_from_colmap(intr.model, intr.params, scaling_factor)
+                )
+                self.intrinsics[intr.id] = create_opencv_pinhole_camera(
+                    focal_length,
+                    principal_point,
+                    width,
+                    height,
+                    radial_coeffs,
+                    tangential_coeffs,
+                    thin_prism_coeffs,
+                )
+
+            elif intr.model == "OPENCV_FISHEYE":
+                params = copy.deepcopy(intr.params)
+                params[:4] = params[:4] / scaling_factor
+                self.intrinsics[intr.id] = create_fisheye_camera(params, width, height)
+
+            else:
+                assert False, (
+                    f"Colmap camera model '{intr.model}' not handled: supported camera models are "
+                    "PINHOLE, SIMPLE_PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, and OPENCV_FISHEYE."
+                )
+
+        # Load poses and paths
+        self.poses = []
+        self.image_paths = []
+        self.mask_paths = []
+
+        cam_centers = []
+        for extr in logger.track(
+            self.cam_extrinsics,
+            description=f"Load Dataset ({self.split})",
+            color="salmon1",
+        ):
+            R = qvec_to_so3(extr.qvec)
+            T = np.array(extr.tvec)
+            W2C = np.zeros((4, 4), dtype=np.float32)
+            W2C[:3, 3] = T
+            W2C[:3, :3] = R
+            W2C[3, 3] = 1.0
+            C2W = np.linalg.inv(W2C)
+            self.poses.append(C2W)
+            cam_centers.append(C2W[:3, 3])
+
+            image_path = os.path.join(self.path, self.get_images_folder(), extr.name)
+            self.image_paths.append(image_path)
+            self.mask_paths.append(os.path.splitext(image_path)[0] + "_mask.png")
+
+        self.camera_centers = np.array(cam_centers)
+        _, diagonal = get_center_and_diag(self.camera_centers)
+        self.cameras_extent = diagonal * 1.1
+
+        self.poses = np.stack(self.poses)
+
+        self.image_paths = np.stack(self.image_paths, dtype=str)
+        self.mask_paths = np.stack(self.mask_paths, dtype=str)
+
+    def _lazy_worker_intrinsics_cache(self):
+        """Create intrinsics cache for a specific worker."""
+        worker_id = get_worker_id()
+
+        # Check if this worker already has cached tensors
+        if worker_id not in self._worker_gpu_cache:
+            # For now, fall back to the original approach for each worker
+            # This ensures each worker creates its own GPU tensors
+            worker_intrinsics = {}
+            for intr_id, (
+                params_dict,
+                rays_ori,
+                rays_dir,
+                camera_name,
+                pixel_coords,
+            ) in self.intrinsics.items():
+                # Create new GPU tensors for this worker
+                worker_rays_ori = rays_ori.to(self.device, non_blocking=True)
+                worker_rays_dir = rays_dir.to(self.device, non_blocking=True)
+                worker_pixel_coords = pixel_coords.to(self.device, non_blocking=True)
+                worker_intrinsics[intr_id] = (
+                    params_dict,
+                    worker_rays_ori,
+                    worker_rays_dir,
+                    camera_name,
+                    worker_pixel_coords,
+                )
+            self._worker_gpu_cache[worker_id] = worker_intrinsics
+
+        return self._worker_gpu_cache[worker_id]
+
+    @torch.no_grad()
+    def compute_spatial_extents(self):
+        camera_origins = torch.FloatTensor(self.poses[:, :3, 3])
+        center = camera_origins.mean(dim=0)
+        dists = torch.linalg.norm(camera_origins - center[None, :], dim=-1)
+        mean_dist = torch.mean(dists)  # mean distance between of cameras from center
+        bbox_min = torch.min(camera_origins, dim=0).values
+        bbox_max = torch.max(camera_origins, dim=0).values
+        return center, mean_dist, (bbox_min, bbox_max)
+
+    def get_length_scale(self):
+        return self.length_scale
+
+    def get_center(self):
+        return self.center
+
+    def get_scene_bbox(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.scene_bbox
+
+    def get_scene_extent(self):
+        return self.cameras_extent
+
+    def get_observer_points(self):
+        return self.camera_centers
+
+    def get_poses(self) -> np.ndarray:
+        """Get camera poses as 4x4 transformation matrices.
+
+        COLMAP Dataset Implementation:
+        COLMAP naturally provides poses in a coordinate system compatible with
+        3DGRUT's "right down front" convention, so no coordinate conversion is needed.
+
+        The poses are constructed from COLMAP's world-to-camera matrices by:
+        1. Building W2C from rotation (qvec_to_so3) and translation (tvec)
+        2. Inverting to get camera-to-world: C2W = inv(W2C)
+
+        Returns:
+            np.ndarray: Camera poses with shape (N, 4, 4) in "right down front" convention
+        """
+        return self.poses
+
+    def get_intrinsics_idx(self, extr_idx: int):
+        return self.cam_extrinsics[extr_idx].camera_id
+
+    def get_camera_idx(self, frame_idx: int) -> int:
+        """Return 0-based camera index for a given frame index.
+
+        Maps from COLMAP's potentially non-contiguous camera_id to a
+        0-based contiguous index.
+        """
+        colmap_camera_id = self.cam_extrinsics[frame_idx].camera_id
+        return self._camera_id_to_idx[colmap_camera_id]
+
+    def get_frames_per_camera(self) -> list[int]:
+        """Return list of frame counts per camera.
+
+        Returns a list where index i contains the number of frames captured
+        by camera i (using 0-based camera indices). Derived values:
+        - num_cameras = len(frames_per_camera)
+        - num_frames = sum(frames_per_camera)
+        """
+        num_cameras = len(self.cam_intrinsics)
+        counts = [0] * num_cameras
+        for extr in self.cam_extrinsics:
+            camera_idx = self._camera_id_to_idx[extr.camera_id]
+            counts[camera_idx] += 1
+        return counts
+
+    def get_camera_names(self) -> list[str]:
+        """Return list of camera names.
+
+        For multi-camera setups where images are organized in subfolders by camera,
+        returns the folder names. For single-camera setups (images directly in images
+        folder), returns default names like "camera_0".
+        """
+        num_cameras = len(self.cam_intrinsics)
+        names: list[str | None] = [None] * num_cameras
+
+        # Find one image path for each camera to determine folder name
+        for extr in self.cam_extrinsics:
+            camera_idx = self._camera_id_to_idx[extr.camera_id]
+            if names[camera_idx] is not None:
+                continue  # Already have a name for this camera
+
+            # extr.name is relative path from images folder
+            # e.g., "cam_front/image001.jpg" or just "image001.jpg"
+            parent_folder = os.path.dirname(extr.name)
+            if parent_folder:
+                names[camera_idx] = parent_folder
+            else:
+                names[camera_idx] = f"camera_{camera_idx}"
+
+        return names
+
+    def __len__(self) -> int:
+        return self.n_frames
+
+    @torch.cuda.nvtx.range("colmap_dataset::_getitem")
+    def __getitem__(self, idx) -> dict:
+        # Load image and get its actual dimensions
+        image_data = np.asarray(Image.open(self.image_paths[idx]))
+        actual_h, actual_w = image_data.shape[:2]
+
+        # Use actual image dimensions for output shape
+        out_shape = (1, actual_h, actual_w, 3)
+
+        assert image_data.dtype == np.uint8, "Image data must be of type uint8"
+
+        output_dict = {
+            "data": torch.tensor(image_data).unsqueeze(0),
+            "pose": torch.tensor(self.poses[idx]).unsqueeze(0),
+            "intr": self.get_intrinsics_idx(idx),
+            "camera_idx": self.get_camera_idx(idx),
+            "frame_idx": idx,
+        }
+
+        # Only add mask to dictionary if it exists
+        if os.path.exists(mask_path := self.mask_paths[idx]):
+            mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).reshape(1, actual_h, actual_w, 1)
+            output_dict["mask"] = mask
+
+        # Add EXIF exposure if available for this frame
+        if self.exif_exposures is not None and self.exif_exposures[idx] is not None:
+            output_dict["exposure"] = torch.tensor(self.exif_exposures[idx], dtype=torch.float32)
+
+        return output_dict
+
+    def get_gpu_batch_with_intrinsics(self, batch):
+        """Add the intrinsics to the batch and move data to GPU."""
+
+        data = batch["data"][0].to(self.device, non_blocking=True) / 255.0
+        pose = batch["pose"][0].to(self.device, non_blocking=True)
+        intr = batch["intr"][0].item()
+
+        assert data.dtype == torch.float32
+        assert pose.dtype == torch.float32
+
+        # Get intrinsics for current worker
+        worker_intrinsics = self._lazy_worker_intrinsics_cache()
+
+        camera_params_dict, rays_ori, rays_dir, camera_name, pixel_coords = worker_intrinsics[intr]
+
+        sample = {
+            "rgb_gt": data,
+            "rays_ori": rays_ori,
+            "rays_dir": rays_dir,
+            "T_to_world": pose,
+            f"intrinsics_{camera_name}": camera_params_dict,
+            "camera_idx": batch["camera_idx"][0].item(),
+            "frame_idx": batch["frame_idx"][0].item(),
+            "pixel_coords": pixel_coords,
+        }
+
+        if "mask" in batch:
+            mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0
+            mask = (mask > 0.5).to(torch.float32)
+            sample["mask"] = mask
+
+        # Add exposure prior from EXIF if available (move to GPU)
+        if "exposure" in batch and batch["exposure"][0] is not None:
+            sample["exposure"] = batch["exposure"].to(self.device)
+
+        return Batch(**sample)

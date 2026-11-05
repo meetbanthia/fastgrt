@@ -1,0 +1,81 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+//
+// 3DGRT tracer -- ANY-HIT, compiled per primitive: TRIANGLE_PRIM (icosahedron,
+// 20 triangles per gaussian) or INSTANCE_PRIM (instances, one per gaussian).
+//
+// Port of OptiX __anyhit__ah, matching the nvpro vk_gaussian_splatting reference
+// (threedgrt_raytrace.rahit). It gathers the window's k nearest hits, and once the
+// buffer is full, any candidate at/beyond the farthest buffered hit is
+// *committed* (we simply return without ignoreIntersectionEXT) instead of
+// ignored. Committing shrinks the ray's tmax, so the hardware prunes all farther
+// BVH traversal. (Requires gl_RayFlagsSkipClosestHitShaderEXT in raygen, since
+// there is no closest-hit shader; the commit only serves to shorten the ray.)
+
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "bindings.glsl"
+#include "rt_payload.glsl"
+
+#define NUM_TRI_PER_PRIM 20u   // icosahedron: 20 triangles per gaussian
+
+
+layout(location = 0) rayPayloadInEXT HitPayload prd;
+#include "rt_payload_static.glsl"
+hitAttributeEXT vec2 hitAttr;   // .rint attribute (instances) / built-in barycentrics (triangles); unused
+
+// Per-launch scratch; base/slot mapping is shared with every raygen reader.
+// Write-only here (fire-and-forget); the raygen reads it back after the trace.
+layout(set = 0, binding = 16, scalar) writeonly buffer HitScratch { uint v[]; } hitScr;
+
+
+void main() {
+    float hT = gl_HitTEXT;
+
+    // ------- unsorted k-nearest buffer: O(1) append / O(1) evict-max -------
+    // The ordering work is deferred to the raygen (loadAndSortHits, once per
+    // window) instead of running an O(k) shift-down on the traversal critical
+    // path for every gathered candidate. The buffer CONTENTS stay identical to
+    // the sorted variant (the k nearest hits in the window), so integration
+    // order, ray shortening and the final image are bit-identical.
+    //
+    // Ray shortening follows OptiX's rule: a candidate that the buffer keeps is
+    // also committed when, after the insert, the buffer is full and this
+    // candidate is its farthest entry. tmax then drops to the k-th nearest
+    // distance at once, instead of at the next candidate beyond it. Anything
+    // farther can no longer enter the buffer, so its contents do not change.
+    bool commitHit = false;
+    uint cnt    = prd.cntMax & 0xFFFFu;
+    uint maxIdx = prd.cntMax >> 16;
+    bool full   = (cnt >= uint(MAX_HITS_PER_TRACE));
+    if (!full || hT < prd.maxHitDistance) {
+#ifdef INSTANCE_PRIM
+        uint id = uint(gl_InstanceID);   // one instance per gaussian, in gaussian order
+#else
+        uint id = gl_PrimitiveID / NUM_TRI_PER_PRIM;
+#endif
+        const uint scrBase = hitScratchBase();
+#define STORE_ID(slot) hitScr.v[hitScratchSlot(scrBase, (slot))] = id
+        if (!full) {
+            float oldMax = prd.maxHitDistance;
+            setPayloadDistance(cnt, hT);
+            STORE_ID(cnt);
+            if (hT > oldMax) prd.maxHitDistance = hT;
+            if (hT > oldMax) maxIdx = cnt;
+            prd.cntMax = (cnt + 1u) | (maxIdx << 16);
+            commitHit = (cnt + 1u >= uint(MAX_HITS_PER_TRACE)) && (hT >= oldMax);
+        } else {
+            // evict the current farthest, then rescan for the new max (loads only)
+            setPayloadDistance(maxIdx, hT);
+            STORE_ID(maxIdx);
+            uint mi = payloadMaxIndex(hT, maxIdx);
+            prd.cntMax = cnt | (mi << 16);
+            commitHit = (mi == maxIdx);   // the rescan's strict > keeps hT's slot only if hT is the max
+        }
+#undef STORE_ID
+        if (!commitHit) ignoreIntersectionEXT;
+    }
+    // full && hT >= current max: fall through -> commit -> shorten ray.
+
+}

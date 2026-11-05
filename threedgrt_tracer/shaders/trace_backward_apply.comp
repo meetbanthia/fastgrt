@@ -1,0 +1,224 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+//
+// BACKWARD (hit replay): gradient compute pass.
+//
+// Reads the per-ray accepted-hit lists the training forward archived (the split
+// blend pass and the tail raygen, in front-to-back order) and runs the exact
+// processHitBwd chain per hit -- the same gradients as re-tracing the ray, since
+// processHitBwd re-derives everything from the gaussian id and replays the
+// composite state internally. Being a plain compute kernel, its (large) register
+// footprint costs only itself: there is no BVH traversal here for it to starve.
+//
+// The gradients are scattered by the whole subgroup at once. At each list
+// position every lane writes the 59 gradients of its hit (48 SH coefficients,
+// then the 11 geometry values in ParticleDensity order) to its own row of
+// shared memory. Then, for each Gaussian some lane hit, the lanes split that
+// Gaussian's columns, each sums its column over the lanes that hit it, and the
+// subgroup issues one atomic per column to consecutive addresses -- instead of
+// 59 scattered atomics per lane per hit. Neighbouring rays tend to hit the same
+// Gaussian at the same list position, so this also merges their updates. The
+// subgroup stays converged for it: every lane runs to the longest list in its
+// subgroup; lanes past their own list (or outside the frame) only help scatter.
+// APPLY_DIRECT_ATOMICS (render.subgroup_atomics=false) turns the subgroup scatter
+// off: every lane adds its own row with one global atomic per gradient value, to
+// measure what the scatter saves. The gradients are the same up to float rounding.
+//
+// Overflow rays (the split forward's tail finished them past the archive)
+// are replayed here like every other ray -- the archive holds their first rounds exactly
+// -- and their backward state after that prefix is handed to the overflow raygen through
+// the split state planes, so it only traces the rest of the ray.
+
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_memory_scope_semantics : require
+
+#include "bindings.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#ifndef SPH_NUM_COEFFS
+#define SPH_NUM_COEFFS 16
+#endif
+
+layout(set = 0, binding = 2, scalar) readonly buffer Density  { ParticleDensity particles[]; } density;
+layout(set = 0, binding = 3, scalar) readonly buffer Radiance { float16_t sh[]; } radiance;
+layout(set = 0, binding = 4, scalar) readonly buffer RayOriBuf { float v[]; } rayOriBuf;
+layout(set = 0, binding = 5, scalar) readonly buffer RayDirBuf { float v[]; } rayDirBuf;
+
+layout(set = 0, binding = 6,  scalar) readonly buffer FwdRad { float v[]; } fwdRad;
+layout(set = 0, binding = 7,  scalar) readonly buffer FwdDns { float v[]; } fwdDns;
+layout(set = 0, binding = 8,  scalar) readonly buffer FwdHit { float v[]; } fwdHit;   // 2 per ray
+layout(set = 0, binding = 10, scalar) readonly buffer GradRad { float v[]; } gradRad;
+layout(set = 0, binding = 11, scalar) readonly buffer GradDns { float v[]; } gradDns;
+layout(set = 0, binding = 12, scalar) readonly buffer GradHit { float v[]; } gradHit;
+
+// Gradient outputs, addressed as flat floats by the scatter (ParticleDensity is
+// 12 floats: position 0-2, density 3, quaternion 4-7, scale 8-10, padding 11).
+layout(set = 0, binding = 14, scalar) buffer DensityGradF { float v[]; } densityGradF;
+layout(set = 0, binding = 15, scalar) buffer RadGrad      { float sh[]; } radGrad;
+
+#define BWD_ARCHIVE_READ_ONLY
+#include "bwd_archive.glsl"
+layout(set = 0, binding = 18, scalar) readonly buffer BwdHitCnt { uint v[]; } bwdCnt;  // 1 per ray
+
+// ---- staged gradient rows: one per invocation, odd stride against bank conflicts ----
+#define SPH_COLS   (SPH_NUM_COEFFS * 3)
+#define ROW_COLS   (SPH_COLS + 11)
+#define ROW_STRIDE (ROW_COLS | 1)
+#define WG_SIZE    64
+#if ROW_COLS > 64
+#error "the scatter sums two columns per lane of a 32-wide subgroup"
+#endif
+shared float stagedRows[WG_SIZE * ROW_STRIDE];
+uint stagedRow;   // this invocation's row offset; rows are indexed by subgroup id and lane
+#define GRAD_SPH(base, c, v)         stagedRows[stagedRow + (c)] = (v)
+#define GRAD_DNS(pid, field, off, v) stagedRows[stagedRow + SPH_COLS + (off)] = (v)
+
+#include "gaussian_common.glsl"
+#include "gaussian_ops.glsl"
+#include "gaussian_ops_bwd.glsl"  // processHitBwd
+#include "split_state.glsl"      // hand-over planes for overflow rays
+
+#define STEP_BARRIER() controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease)
+
+// Column c of a staged row goes to colour coefficient c, or to geometry value c - SPH_COLS.
+void addColumn(uint c, float v, uint particle, uint sphCount) {
+    if (c < uint(SPH_COLS)) {
+        if (c < sphCount) atomicAdd(radGrad.sh[particle * uint(SPH_COLS) + c], v);
+    } else if (c < uint(ROW_COLS)) {
+        atomicAdd(densityGradF.v[particle * 12u + (c - uint(SPH_COLS))], v);
+    }
+}
+
+#ifdef APPLY_DIRECT_ATOMICS
+// No subgroup reduction: every lane adds its own staged row with one global atomic per
+// gradient value.
+void scatterStagedRows(uint key, uint sphCount) {
+    if (key == INVALID) return;
+    for (uint c = 0u; c < uint(ROW_COLS); ++c) addColumn(c, stagedRows[stagedRow + c], key, sphCount);
+}
+#else
+// Called by the whole subgroup, which is 32 lanes wide (the host checks), so a lane set
+// is one uint and a row's 59 columns are two per lane. key: the particle whose row this
+// lane staged, or INVALID.
+void scatterStagedRows(uint key, uint sphCount) {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint firstRow = gl_SubgroupID * 32u * ROW_STRIDE;
+    uint pending = subgroupBallot(key != INVALID).x;
+    while (pending != 0u) {   // subgroup-uniform: one pass per distinct particle
+        const uint particle = subgroupShuffle(key, uint(findLSB(pending)));
+        uint members = subgroupBallot(key == particle).x;
+        pending &= ~members;
+        // sum both of this lane's columns over the members, in lane order
+        float lo = 0.0, hi = 0.0;
+        while (members != 0u) {
+            const uint row = firstRow + uint(findLSB(members)) * ROW_STRIDE;
+            members &= members - 1u;
+            lo += stagedRows[row + lane];
+            if (lane + 32u < uint(ROW_COLS)) hi += stagedRows[row + 32u + lane];
+        }
+        addColumn(lane, lo, particle, sphCount);
+        addColumn(lane + 32u, hi, particle, sphCount);
+    }
+}
+#endif
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint b = gl_GlobalInvocationID.z;
+    const bool inFrame = x < params.frameW && y < params.frameH && b < params.frameB;
+    stagedRow = (gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID) * ROW_STRIDE;
+
+    uint pix = inFrame ? (b * params.frameH + y) * params.frameW + x : 0u;
+
+    const uint rawCnt = inFrame ? bwdCnt.v[pix] : 0u;
+    // overflow rays (BWD_CNT_OVERFLOW) replay their archived prefix here too
+    const bool overflowRay = (rawCnt & BWD_CNT_OVERFLOW) != 0u;
+    const uint cnt = min(rawCnt & ~BWD_CNT_OVERFLOW, archiveCapacity());
+    // every lane runs to the longest list in its subgroup (uniform exit below)
+    const uint subgroupCnt = subgroupMax(cnt);
+    if (subgroupCnt == 0u) return;
+    const uint archivePix = inFrame ? archiveRayIndex(pix, x, y, b) : 0u;
+
+
+    vec3 ro = vec3(0.0), rd = vec3(0.0, 0.0, 1.0);
+    vec3  rayIntegratedRadiance      = vec3(0.0);
+    float rayIntegratedTransmittance = 1.0;
+    float rayIntegratedHitDistance   = 0.0;
+    vec3  rayRadianceGrad      = vec3(0.0);
+    float rayTransmittanceGrad = 0.0;
+    float rayHitDistanceGrad   = 0.0;
+    if (cnt > 0u) {
+        vec3 oL = vec3(rayOriBuf.v[pix*3+0], rayOriBuf.v[pix*3+1], rayOriBuf.v[pix*3+2]);
+        vec3 dL = vec3(rayDirBuf.v[pix*3+0], rayDirBuf.v[pix*3+1], rayDirBuf.v[pix*3+2]);
+        ro = vec3(dot(params.rayToWorld0.xyz, oL) + params.rayToWorld0.w,
+                  dot(params.rayToWorld1.xyz, oL) + params.rayToWorld1.w,
+                  dot(params.rayToWorld2.xyz, oL) + params.rayToWorld2.w);
+        rd = vec3(dot(params.rayToWorld0.xyz, dL),
+                  dot(params.rayToWorld1.xyz, dL),
+                  dot(params.rayToWorld2.xyz, dL));
+
+        rayIntegratedRadiance      = vec3(fwdRad.v[pix*3+0], fwdRad.v[pix*3+1], fwdRad.v[pix*3+2]);
+        rayIntegratedTransmittance = 1.0 - fwdDns.v[pix];
+        rayIntegratedHitDistance   = fwdHit.v[pix*2+0];
+
+        rayRadianceGrad      = vec3(gradRad.v[pix*3+0], gradRad.v[pix*3+1], gradRad.v[pix*3+2]);
+        rayTransmittanceGrad = -1.0 * gradDns.v[pix];
+        rayHitDistanceGrad   = gradHit.v[pix];
+    }
+
+    vec3  rayRadiance      = vec3(0.0);
+    float rayTransmittance = 1.0;
+    float rayHitDistance   = 0.0;
+    const int sphDeg = params.sphDegree;
+    const uint sphCount = 3u * uint((sphDeg + 1) * (sphDeg + 1));
+
+    // Each window holds its accepted ids at its front, then one INVALID. The
+    // subgroup walks the windows together and, within a window, steps until no lane has an id
+    // left: about as many steps as the most accepted hits any lane has in that window, instead
+    // of k. Every lane reads the same slot, so the reads stay coalesced, and neighbouring rays'
+    // n-th accepted hits in a window still tend to be the same Gaussian.
+    const uint winK = uint(MAX_HITS_PER_TRACE);
+    const uint nWin = (cnt + winK - 1u) / winK;
+    const uint subgroupWins = subgroupMax(nWin);
+    for (uint w = 0u; w < subgroupWins; ++w) {
+        bool open = w < nWin;
+        for (uint j = 0u; j < winK; ++j) {
+            uint pid = INVALID;
+            if (open) {
+                const uint slot = w * winK + j;
+                pid = slot < cnt ? archiveLoad(slot, archivePix) : INVALID;
+                if (pid == INVALID) open = false;
+            }
+            if (subgroupBallot(pid != INVALID).x == 0u) break;   // subgroup-uniform
+            uint key = INVALID;
+            if (pid != INVALID &&
+                processHitBwd(ro, rd, pid,
+                              params.minResponse, params.minAlpha, params.minTransmittance, sphDeg,
+                              rayIntegratedTransmittance,
+                              rayTransmittance, rayTransmittanceGrad,
+                              rayIntegratedRadiance, rayRadiance, rayRadianceGrad,
+                              rayIntegratedHitDistance, rayHitDistance, rayHitDistanceGrad))
+                key = pid;
+            STEP_BARRIER();
+            scatterStagedRows(key, sphCount);
+            STEP_BARRIER();
+        }
+    }
+    if (overflowRay) {
+        // the overflow raygen continues this ray's backward from here (it reads the
+        // round cap's cursor from plane 6, which the gather left there)
+        const uint sp = pix;
+        stateF.v[0u * params.statePlaneRays + sp] = rayTransmittance;
+        stateF.v[2u * params.statePlaneRays + sp] = rayRadiance.x;
+        stateF.v[3u * params.statePlaneRays + sp] = rayRadiance.y;
+        stateF.v[4u * params.statePlaneRays + sp] = rayRadiance.z;
+        stateF.v[5u * params.statePlaneRays + sp] = rayHitDistance;
+    }
+}

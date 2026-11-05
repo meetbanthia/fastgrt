@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# threedgrt_vulkan: a Vulkan (ray-query) port of the 3DGRT tracer from 3dgrut.
+# Only the 3DGRT pipeline is included (no 3DGUT). The renderer-agnostic Python
+# pipeline (training / datasets / model / losses / strategies) is reused
+# unchanged from 3dgrut; only the C++/GPU tracer backend is replaced with Vulkan.
+
+[build-system]
+requires = ["setuptools==78.1.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "threedgrt_vulkan"
+version = "0.1.0"
+description = "Vulkan ray-query port of 3D Gaussian Ray Tracing (3DGRT)"
+requires-python = ">=3.11"
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+]
+
+dependencies = [
+    "setuptools==78.1.1",
+    "pillow",
+    "ninja",
+    "plyfile",
+    "torchmetrics",
+    "addict",
+    "dataclasses_json",
+    "einops",
+    "fire",
+    "hydra-core",
+    "imageio",
+    "kornia",
+    "msgpack",
+    "numpy",
+    "omegaconf",
+    "opencv-python",
+    "piexif",
+    "pytest",
+    "rich",
+    "scikit-learn",
+    "tensorboard",
+    "torch",
+    "torchvision",
+    "tqdm",
+    "wandb",
+    "simplejpeg",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black==26.3.1",
+    "isort==5.13.0",
+    "clang-format==18.1.8",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+# torch.utils.cpp_extension.load compiles the tracer at runtime, so the package
+# must ship the C++/Vulkan sources and the GLSL shaders.
+"threedgrt_tracer" = ["include/**/*", "src/**/*", "shaders/**/*", "*.cpp"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["threedgrt*", "threedgrt_tracer*"]
+exclude = [".venv*"]
+
+[tool.black]
+target-version = ["py311"]
+line-length = 120
+
+[tool.isort]
+skip_gitignore = true
+profile = "black"
